@@ -21,7 +21,7 @@ function saveWallets(data) {
 
 const SOLANA_PUBKEY_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-export function addSmartWallet({ name, address, category = "alpha" }) {
+export function addSmartWallet({ name, address, category = "alpha", type = "lp" }) {
   if (!SOLANA_PUBKEY_RE.test(address)) {
     return { success: false, error: "Invalid Solana address format" };
   }
@@ -30,10 +30,10 @@ export function addSmartWallet({ name, address, category = "alpha" }) {
   if (existing) {
     return { success: false, error: `Already tracked as "${existing.name}"` };
   }
-  data.wallets.push({ name, address, category, addedAt: new Date().toISOString() });
+  data.wallets.push({ name, address, category, type, addedAt: new Date().toISOString() });
   saveWallets(data);
-  log("smart_wallets", `Added wallet: ${name} (${category})`);
-  return { success: true, wallet: { name, address, category } };
+  log("smart_wallets", `Added wallet: ${name} (${category}, type=${type})`);
+  return { success: true, wallet: { name, address, category, type } };
 }
 
 export function removeSmartWallet({ address }) {
@@ -56,7 +56,9 @@ const _cache = new Map(); // address -> { positions, fetchedAt }
 const CACHE_TTL = 5 * 60 * 1000;
 
 export async function checkSmartWalletsOnPool({ pool_address }) {
-  const { wallets } = loadWallets();
+  const { wallets: allWallets } = loadWallets();
+  // Only check LP-type wallets — holder wallets don't have positions
+  const wallets = allWallets.filter((w) => !w.type || w.type === "lp");
   if (wallets.length === 0) {
     return {
       pool: pool_address,

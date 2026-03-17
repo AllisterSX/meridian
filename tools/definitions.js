@@ -407,13 +407,15 @@ Responds with what changed before restarting in 3 seconds.`,
       name: "add_smart_wallet",
       description: `Add a wallet to the smart wallet tracker.
 Use when the user says "add smart wallet", "track this wallet", "add to smart wallets", etc.
-Tracked wallets are used to check if high-confidence LPers are in a pool before deploying.`,
+- type "lp": wallet is tracked for LP positions (checked before deploying). Use for LPers/whales.
+- type "holder": wallet is only checked for token holdings (never fetches positions). Use for KOLs/traders who don't LP.`,
       parameters: {
         type: "object",
         properties: {
           name: { type: "string", description: "Label for this wallet (e.g. 'alpha-1', 'whale-sol')" },
           address: { type: "string", description: "Solana wallet address (base58)" },
-          category: { type: "string", enum: ["alpha", "smart", "fast", "multi"], description: "Wallet type (default: alpha)" }
+          category: { type: "string", enum: ["alpha", "smart", "fast", "multi"], description: "Wallet category (default: alpha)" },
+          type: { type: "string", enum: ["lp", "holder"], description: "lp = tracks LP positions, holder = tracks token holdings only (default: lp)" }
         },
         required: ["name", "address"]
       }
