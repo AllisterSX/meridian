@@ -129,7 +129,7 @@ Always call this before deploying a position to get the freshest price.`,
 You have autonomy to choose strategy and range based on pool metrics.
 
 HARD RULES:
-- Strategy: 'spot' or 'bid_ask' ONLY. Never use 'curve'.
+- Use the lp_strategy from the active strategy (bid_ask or spot). Never use 'curve'.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
 
 Guidelines:
@@ -158,8 +158,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask"],
-            description: "DLMM strategy type. Only bid_ask is allowed."
+            enum: ["bid_ask", "spot"],
+            description: "DLMM strategy type. Use bid_ask (default) or spot. Match the active strategy's lp_strategy field."
           },
           bins_below: {
             type: "number",
