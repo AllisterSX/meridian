@@ -281,8 +281,8 @@ export async function executeTool(name, args) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
-            if (token && token.usd_value >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd_value.toFixed(2)}) back to SOL`);
+            if (token && token.usd >= 0.10) {
+              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
               await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
             }
           } catch (e) {
@@ -293,8 +293,8 @@ export async function executeTool(name, args) {
         try {
           const balances = await getWalletBalances({});
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
-          if (token && token.usd_value >= 0.10) {
-            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd_value.toFixed(2)}) back to SOL`);
+          if (token && token.usd >= 0.10) {
+            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
             await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
           }
         } catch (e) {
