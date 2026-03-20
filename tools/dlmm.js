@@ -524,21 +524,26 @@ export async function claimFees({ position_address }) {
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
 
-    const tx = await pool.claimSwapFee({
+    const positionData = await pool.getPosition(new PublicKey(position_address));
+    const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
-      position: new PublicKey(position_address),
+      position: positionData,
     });
 
-    if (!tx) {
+    if (!txs || txs.length === 0) {
       return { success: false, error: "No fees to claim — transaction is empty" };
     }
 
-    const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-    log("claim", `SUCCESS tx: ${txHash}`);
+    const txHashes = [];
+    for (const tx of txs) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      txHashes.push(txHash);
+    }
+    log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
 
-    return { success: true, position: position_address, tx: txHash };
+    return { success: true, position: position_address, txs: txHashes };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -567,13 +572,18 @@ export async function closePosition({ position_address }) {
     // ─── Step 1: Claim Fees (to clear account state) ───────────
     try {
       log("close", `Step 1: Claiming fees for ${position_address}`);
-      const claimTx = await pool.claimSwapFee({
+      const positionData = await pool.getPosition(positionPubKey);
+      const claimTxs = await pool.claimSwapFee({
         owner: wallet.publicKey,
-        position: positionPubKey,
+        position: positionData,
       });
-      const claimHash = await sendAndConfirmTransaction(getConnection(), claimTx, [wallet]);
-      txHashes.push(claimHash);
-      log("close", `Step 1 OK: ${claimHash}`);
+      if (claimTxs && claimTxs.length > 0) {
+        for (const tx of claimTxs) {
+          const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+          txHashes.push(claimHash);
+        }
+        log("close", `Step 1 OK: ${txHashes.join(", ")}`);
+      }
     } catch (e) {
       log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
     }
