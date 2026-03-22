@@ -111,8 +111,15 @@ export function startCronJobs() {
       positions = livePositions?.positions || [];
 
       if (positions.length === 0) {
-        log("cron", "Management skipped — no open positions");
+        log("cron", "No open positions — triggering screening cycle");
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         return;
+      }
+
+      // Also trigger screening if under max positions — runs in background, doesn't block management
+      if (positions.length < config.risk.maxPositions) {
+        log("cron", `Positions (${positions.length}/${config.risk.maxPositions}) — triggering screening in background`);
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       }
 
       // Snapshot + PnL fetch in parallel for all positions
@@ -183,7 +190,7 @@ REPORT FORMAT (one per position):
     }
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
+  async function runScreeningCycle() {
     if (_screeningBusy) return;
 
     // Hard guards — don't even run the agent if preconditions aren't met
@@ -292,7 +299,9 @@ STEPS:
         if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
       }
     }
-  });
+  }
+
+  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
