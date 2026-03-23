@@ -93,6 +93,7 @@ async function maybeRunMissedBriefing() {
 
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
+  if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   _cronTasks = [];
 }
 
@@ -403,7 +404,27 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
+  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
+  let _pnlPollBusy = false;
+  const pnlPollInterval = setInterval(async () => {
+    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+    _pnlPollBusy = true;
+    try {
+      const result = await getMyPositions({ force: true }).catch(() => null);
+      if (!result?.positions?.length) return;
+      for (const p of result.positions) {
+        if (p.pnl_pct == null) continue;
+        const exit = updatePnlAndCheckExits(p.position, p.pnl_pct, config.management);
+        if (exit) log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason}`);
+      }
+    } finally {
+      _pnlPollBusy = false;
+    }
+  }, 30_000);
+
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  // Store interval ref so stopCronJobs can clear it
+  _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
