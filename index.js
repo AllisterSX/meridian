@@ -116,17 +116,6 @@ export async function runManagementCycle({ silent = false } = {}) {
       return null;
     }
 
-    // Enforce management interval based on most volatile open position
-    const maxVolatility = positions.reduce((max, p) => {
-      const tracked = getTrackedPosition(p.position);
-      return Math.max(max, tracked?.volatility ?? 0);
-    }, 0);
-    const targetInterval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
-    if (config.schedule.managementIntervalMin !== targetInterval) {
-      config.schedule.managementIntervalMin = targetInterval;
-      log("cron", `Management interval adjusted to ${targetInterval}m (max volatility: ${maxVolatility}) — takes effect next restart`);
-    }
-
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
       recordPositionSnapshot(p.pool, p);
