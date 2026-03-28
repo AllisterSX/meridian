@@ -1,0 +1,17 @@
+{
+  "weights": {
+    "organic_score": 1,
+    "fee_tvl_ratio": 1,
+    "volume": 1,
+    "mcap": 1,
+    "holder_count": 1,
+    "smart_wallets_present": 1,
+    "narrative_quality": 1,
+    "study_win_rate": 1,
+    "hive_consensus": 1,
+    "volatility": 1
+  },
+  "last_recalc": null,
+  "recalc_count": 0,
+  "history": []
+}

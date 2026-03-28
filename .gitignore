@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+
+# User config (contains RPC URL, wallet key, API keys)
+user-config.json
+
+# Runtime state (position tracking, lessons — user-specific)
+state.json
+lessons.json
+smart-wallets.json
+pool-memory.json
+token-blacklist.json
+strategy-library.json
+
+# Logs
+logs/
+
+# Web UI
+web/node_modules/
+web/dist/
+
+# OS
+.DS_Store
+
+# Dev context
+context.md
