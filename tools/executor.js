@@ -341,15 +341,27 @@ export async function executeTool(name, args) {
     return { error };
   }
 
+  // Strip model artifact suffixes (e.g. gpt-oss leaks "<|channel|>commentary")
+  const cleanName = name.split("<|")[0].trim();
+  if (cleanName !== name) {
+    log("agent", `Tool name sanitized: "${name}" → "${cleanName}"`);
+    name = cleanName;
+  }
+
   // ─── Pre-execution safety checks ──────────
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args);
+    log("safety", `Running safety check for ${name}`);
+    let safetyCheck;
+    try {
+      safetyCheck = await runSafetyChecks(name, args);
+    } catch (safetyErr) {
+      log("safety", `Safety check threw for ${name}: ${safetyErr.message} — blocking`);
+      return { blocked: true, reason: `Safety check error: ${safetyErr.message}` };
+    }
+    log("safety", `Safety check result: pass=${safetyCheck.pass} reason=${safetyCheck.reason}`);
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
-      return {
-        blocked: true,
-        reason: safetyCheck.reason,
-      };
+      return { blocked: true, reason: safetyCheck.reason };
     }
   }
 
@@ -404,7 +416,29 @@ export async function executeTool(name, args) {
           }
 
           if (baseMint) {
-            await swapToSol(baseMint, "L1/L2");
+            const ok = await swapToSol(baseMint, "L1/L2");
+            if (!ok) log("executor_warn", `Auto-swap FAILED for ${baseMint.slice(0,8)} — check wallet manually`);
+          } else {
+            // Layer 3: no base_mint known — use before/after wallet diff
+            log("executor_warn", "Auto-swap Layer 3: no base_mint — running before/after wallet diff");
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              const after = await getWalletBalances();
+              let found = false;
+              const SOL_MINT  = "So11111111111111111111111111111111111111112";
+              const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+              for (const tok of (after.tokens || [])) {
+                if (tok.mint === SOL_MINT || tok.mint === USDC_MINT) continue;
+                if (tok.usd >= 0.10) {
+                  log("executor", `Auto-swap Layer 3: ${tok.symbol || tok.mint.slice(0,8)} ($${tok.usd.toFixed(2)}) → SOL`);
+                  await swapToSol(tok.mint, "L3");
+                  found = true;
+                }
+              }
+              if (!found) log("executor_warn", "Auto-swap Layer 3: no tokens found");
+            } catch (e) {
+              log("executor_warn", `Auto-swap Layer 3 diff failed: ${e.message}`);
+            }
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
@@ -438,6 +472,17 @@ export async function executeTool(name, args) {
       success: false,
     });
 
+    // If deploy failed due to bin slippage, wait 60s before returning
+    if (name === "deploy_position" && error.message?.includes("ExceededBinSlippageTolerance")) {
+      log("executor", "ExceededBinSlippageTolerance — waiting 60s before retry");
+      await new Promise(r => setTimeout(r, 60_000));
+      return {
+        error: error.message,
+        tool: name,
+        hint: "Price moved too fast. Waited 60s — retry with fresh get_active_bin.",
+      };
+    }
+    
     // Return error to LLM so it can decide what to do
     return {
       error: error.message,

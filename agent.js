@@ -271,6 +271,17 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           log("agent", "Empty response, retrying...");
           continue;
         }
+        // Anti-hallucination guard for SCREENER
+        const toolCallsMade = messages.filter(m => m.role === "tool").length;
+        if (agentType === "SCREENER" && toolCallsMade === 0) {
+          log("agent", "SCREENER hallucination detected — final answer with zero tool calls. Forcing retry.");
+          messages.pop();
+          messages.push({
+            role: "user",
+            content: "You returned a final answer without calling any tools. This is not allowed. You MUST call get_top_candidates or discover_pools first, then execute the full screening workflow. Start now.",
+          });
+          continue;
+        }
         log("agent", "Final answer reached");
         log("agent", msg.content);
         return { content: msg.content, userMessage: goal };
@@ -281,14 +292,30 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         const functionName = toolCall.function.name;
         let functionArgs;
 
+        let parseFailed = false;
+
         try {
-          functionArgs = JSON.parse(toolCall.function.arguments);
+          let rawArgs = toolCall.function.arguments || "{}";
+          rawArgs = rawArgs
+            .replace(/```json/gi, "")
+            .replace(/```/g, "")
+            .replace(/,\s*([}\]])/g, "$1")
+            .trim();
+          functionArgs = JSON.parse(rawArgs);
         } catch (parseError) {
           log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-          functionArgs = {};
+          parseFailed = true;
         }
 
-        const result = await executeTool(functionName, functionArgs);
+        let result;
+        if (parseFailed) {
+          log("agent", `Mengingatkan LLM untuk memperbaiki JSON yang cacat...`);
+          result = {
+            error: "CRITICAL PARSING ERROR: Your tool call arguments were invalid JSON (likely a missing comma or unescaped quote). Fix your JSON formatting strictly and try again."
+          };
+        } else {
+          result = await executeTool(functionName, functionArgs);
+        }
 
         return {
           role: "tool",

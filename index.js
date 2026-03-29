@@ -30,6 +30,7 @@ import {
 } from "./session.js";
 import { getScreeningThresholdSummary, getStartupMode } from "./runtime-helpers.js";
 import { startServer } from "./server.js";
+import { buildSystemPrompt, getRangeSelectionText } from "./prompt.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -690,6 +691,7 @@ if (runtimeMode.interactive) {
   // Always start autonomous cycles on launch
   launchCron({ announce: true });
   maybeRunMissedBriefing().catch(() => {});
+  startPolling(handleTelegramMessage, handleCallbackQuery);
 
   // Telegram command handlers
 async function handleCallbackQuery(data) {
@@ -979,9 +981,6 @@ async function handleTelegramMessage(text) {
       busy = false;
     }
 }
-
-  // Telegram bot
-  startPolling(handleTelegramMessage, handleCallbackQuery);
 
   console.log(`
 Commands:
