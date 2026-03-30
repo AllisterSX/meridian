@@ -237,21 +237,63 @@ const screeningIntervalMin = await askNum(
   { min: 5 }
 );
 
-// ─── OKX API (optional — enables bundle/cluster analysis + ATH data) ──────────
-console.log("\n── OKX API (optional) ────────────────────────");
-console.log("   Enables: bundle/cluster analysis, ATH price data");
-console.log("   Get keys at: https://www.okx.com/web3/build");
+// ─── LLM Provider ─────────────────────────────────────────────────────────────
+console.log("\n── LLM Provider ──────────────────────────────");
 
-const okxApiKey     = await ask("OKX API Key     (leave blank to skip)", process.env.OKX_API_KEY ? "*** (already set)" : "");
-const okxSecretKey  = okxApiKey && !okxApiKey.startsWith("***") ? await ask("OKX Secret Key ", "") : "";
-const okxPassphrase = okxApiKey && !okxApiKey.startsWith("***") ? await ask("OKX Passphrase  ", "") : "";
+const LLM_PROVIDERS = [
+  {
+    label:   "OpenRouter   (openrouter.ai — many models)",
+    key:     "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    keyHint: "sk-or-...",
+    modelDefault: "nousresearch/hermes-3-llama-3.1-405b",
+  },
+  {
+    label:   "MiniMax      (api.minimax.io)",
+    key:     "minimax",
+    baseUrl: "https://api.minimax.io/v1",
+    keyHint: "your MiniMax API key",
+    modelDefault: "MiniMax-Text-01",
+  },
+  {
+    label:   "OpenAI       (api.openai.com)",
+    key:     "openai",
+    baseUrl: "https://api.openai.com/v1",
+    keyHint: "sk-...",
+    modelDefault: "gpt-4o",
+  },
+  {
+    label:   "Local / LM Studio / Ollama (OpenAI-compatible)",
+    key:     "local",
+    baseUrl: "http://localhost:1234/v1",
+    keyHint: "(leave blank or type any value)",
+    modelDefault: "local-model",
+  },
+  {
+    label:   "Custom       (any OpenAI-compatible endpoint)",
+    key:     "custom",
+    baseUrl: "",
+    keyHint: "your API key",
+    modelDefault: "",
+  },
+];
 
-// ─── LLM ──────────────────────────────────────────────────────────────────────
-console.log("\n── LLM ───────────────────────────────────────");
+const providerChoice = await askChoice("Select LLM provider:", LLM_PROVIDERS.map((p) => ({ label: p.label, key: p.key })));
+const provider = LLM_PROVIDERS.find((p) => p.key === providerChoice.key);
+
+let llmBaseUrl = provider.baseUrl;
+if (provider.key === "local" || provider.key === "custom") {
+  llmBaseUrl = await ask("Base URL", e("llmBaseUrl", provider.baseUrl || "http://localhost:1234/v1"));
+}
+
+const llmApiKeyExisting = e("llmApiKey", process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || "");
+const llmApiKeyPrompt   = llmApiKeyExisting ? "*** (already set)" : (provider.keyHint || "");
+const llmApiKeyRaw      = await ask("API Key", llmApiKeyExisting ? "*** (already set)" : "");
+const llmApiKey         = llmApiKeyRaw.startsWith("***") ? llmApiKeyExisting : llmApiKeyRaw;
 
 const llmModel = await ask(
-  "LLM model (OpenRouter model ID)",
-  e("llmModel", process.env.LLM_MODEL || "nousresearch/hermes-3-llama-3.1-405b")
+  "Model name",
+  e("llmModel", process.env.LLM_MODEL || provider.modelDefault)
 );
 
 const dryRun = await ask(
@@ -280,26 +322,14 @@ const userConfig = {
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
+  llmProvider: provider.key,
+  llmBaseUrl,
   llmModel,
+  ...(llmApiKey ? { llmApiKey } : {}),
   dryRun: dryRun === "true",
 };
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
-
-// Write OKX keys to .env (only if provided and not already set)
-if (okxApiKey && !okxApiKey.startsWith("***") && okxSecretKey && okxPassphrase) {
-  const envPath = path.join(__dirname, ".env");
-  let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
-  const setEnvVar = (content, key, value) => {
-    const re = new RegExp(`^${key}=.*$`, "m");
-    return re.test(content) ? content.replace(re, `${key}=${value}`) : content + `\n${key}=${value}`;
-  };
-  envContent = setEnvVar(envContent, "OKX_API_KEY", okxApiKey);
-  envContent = setEnvVar(envContent, "OKX_SECRET_KEY", okxSecretKey);
-  envContent = setEnvVar(envContent, "OKX_PASSPHRASE", okxPassphrase);
-  fs.writeFileSync(envPath, envContent.trimStart());
-  console.log("OKX API keys saved to .env");
-}
 
 const presetName = preset ? preset.label : "Custom";
 
@@ -321,7 +351,9 @@ Timeframe:    ${timeframe}
   OOR close:   after ${outOfRangeWaitMinutes} min
   Mgmt:        every ${managementIntervalMin} min
   Screening:   every ${screeningIntervalMin} min
+  Provider:    ${provider.label.split("(")[0].trim()}
   Model:       ${llmModel}
+  Base URL:    ${llmBaseUrl}
   Dry run:     ${dryRun}
 
 Run "npm start" to launch the agent.
