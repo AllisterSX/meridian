@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
+import { getLpOverviewSummary } from "./tools/lp-overview.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -28,6 +29,7 @@ export async function generateBriefing() {
   // 4. Current State
   const openPositions = allPositions.filter(p => !p.closed);
   const perfSummary = getPerformanceSummary();
+  const lpSummary = await getLpOverviewSummary().catch(() => null);
 
   // 5. Format Message
   const lines = [
@@ -54,6 +56,7 @@ export async function generateBriefing() {
     perfSummary
       ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
       : "",
+    lpSummary ? `📡 ${lpSummary}` : "",
     "────────────────"
   ];
 

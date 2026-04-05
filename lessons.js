@@ -11,6 +11,19 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
+
+const MAX_MANUAL_LESSON_LENGTH = 400;
+
+function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
+  if (text == null) return null;
+  const cleaned = String(text)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[<>`]/g, "")
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || null;
+}
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 
@@ -59,6 +72,22 @@ function save(data) {
  */
 export async function recordPerformance(perf) {
   const data = load();
+
+  // Guard against unit-mixed records where a SOL-sized final value is
+  // accidentally written into a USD field (e.g. final_value_usd = 2 for a 2 SOL close).
+  const suspiciousUnitMix =
+    Number.isFinite(perf.initial_value_usd) &&
+    Number.isFinite(perf.final_value_usd) &&
+    Number.isFinite(perf.amount_sol) &&
+    perf.initial_value_usd >= 20 &&
+    perf.amount_sol >= 0.25 &&
+    perf.final_value_usd > 0 &&
+    perf.final_value_usd <= perf.amount_sol * 2;
+
+  if (suspiciousUnitMix) {
+    log("lessons_warn", `Skipped suspicious performance record for ${perf.pool_name || perf.pool}: initial=${perf.initial_value_usd}, final=${perf.final_value_usd}, amount_sol=${perf.amount_sol}`);
+    return;
+  }
 
   const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
   const pnl_pct = perf.initial_value_usd > 0
@@ -113,6 +142,15 @@ export async function recordPerformance(perf) {
       reloadScreeningThresholds();
       log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
     }
+
+    // Darwinian signal weight recalculation
+    if (config.darwin?.enabled) {
+      const { recalculateWeights } = await import("./signal-weights.js");
+      const wResult = recalculateWeights(data.performance, config);
+      if (wResult.changes.length > 0) {
+        log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
+      }
+    }
   }
 
 }
@@ -146,7 +184,12 @@ function derivLesson(perf) {
   let rule = "";
 
   if (outcome === "good" || outcome === "bad") {
-    if (perf.range_efficiency < 30 && outcome === "bad") {
+    // ── DLMM supply trap (Rule 6) — specific lesson, highest priority ──
+    if (String(perf.close_reason || "").toLowerCase().includes("dlmm") ||
+        String(perf.close_reason || "").toLowerCase().includes("supply trapped")) {
+      rule = `AVOID: ${perf.pool_name} base token had supply trapped in Meteora DLMM pools — closed via Rule 6. organic=${perf.organic_score}, volatility=${perf.volatility}. Do NOT redeploy into pools with the same base mint for at least 8h.`;
+      tags.push("dlmm_supply", "screening", "token");
+    } else if (perf.range_efficiency < 30 && outcome === "bad") {
       rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
@@ -166,9 +209,11 @@ function derivLesson(perf) {
 
   if (!rule) return null;
 
+  const safeRule = sanitizeLessonText(rule);
+
   return {
     id: Date.now(),
-    rule,
+    rule: safeRule,
     tags,
     outcome,
     context,
@@ -378,10 +423,12 @@ function nudge(current, target, maxChange) {
  * @param {string}   opts.role   - "SCREENER" | "MANAGER" | "GENERAL" | null (all roles)
  */
 export function addLesson(rule, tags = [], { pinned = false, role = null } = {}) {
+  const safeRule = sanitizeLessonText(rule);
+  if (!safeRule) return;
   const data = load();
   data.lessons.push({
     id: Date.now(),
-    rule,
+    rule: safeRule,
     tags,
     outcome: "manual",
     pinned: !!pinned,
@@ -389,7 +436,7 @@ export function addLesson(rule, tags = [], { pinned = false, role = null } = {})
     created_at: new Date().toISOString(),
   });
   save(data);
-  log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${rule}`);
+  log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${safeRule}`);
 }
 
 /**
@@ -444,6 +491,7 @@ export function listLessons({ role = null, pinned = null, tag = null, limit = 30
 
 /**
  * Remove a lesson by ID.
+ * @internal Available for external callers (e.g. future UI tools). Use removeLessonsByKeyword for bulk removal.
  */
 export function removeLesson(id) {
   const data = load();
@@ -491,7 +539,7 @@ export function clearPerformance() {
 
 // Tags that map to each agent role — used for role-aware lesson injection
 const ROLE_TAGS = {
-  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic"],
+  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic", "dlmm_supply"],
   MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
   GENERAL:  [], // all lessons
 };

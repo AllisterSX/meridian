@@ -1,0 +1,82 @@
+{
+  "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:11:28.456Z"
+  },
+  "whamNNP9tHoxLg92yHvJPdYhghEoCg1qYTsh5a2oLbx": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:11:32.056Z"
+  },
+  "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:11:34.352Z"
+  },
+  "AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:11:49.956Z"
+  },
+  "5FqUo9aBjsp7QeeyN6Vi2ZmF2fjS4H5EU7wnAQwPy17z": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:11:52.868Z"
+  },
+  "HiSo5kykqDPs3EG14Fk9QY4B5RvkuEs8oJTiqPX3EDAn": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:12:05.816Z"
+  },
+  "8HeDT75s5g4CtCimH5B5nySqCiQhtWii2UnZhxBtFo38": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:12:27.708Z"
+  },
+  "HTM87R4mgjDdiF6Yfn8duK9vbDmZxiPCTRbGvm7eCAJY": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:12:55.764Z"
+  },
+  "dtrzJPj7yDdvm6eRqBAgxsK2sMJeD9HhBEBB3XMedXy": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:13:11.018Z"
+  },
+  "8i5U2uNBEuTc4zskYP14zbebDg2RSwrrG8REhEnJb97K": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:13:34.572Z"
+  },
+  "9wRuFPJZFviuHv9q4hsaxUUADDphX6oSjcMA3RuxTFRG": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:13:50.235Z"
+  },
+  "D6bTtoSgLknJ9KrgDFUtB5WpqomrNEjBJipVVRoFh2DC": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:14:04.161Z"
+  },
+  "Aqje5DsN4u2PHmQxGF9PKfpsDGwQRCBhWeLKHCFhSMXk": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:14:14.927Z"
+  },
+  "6nU2L7MQVUWjtdKHVpuZA9aind73nd3rXC4YFo8KQCy4": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:14:25.647Z"
+  },
+  "95ZCf3jKMHeFYvPXVZW3Ek6AEPDyjebosqnc7eNioVMo": {
+    "label": "malicious dev",
+    "reason": "User requested blacklist",
+    "added_at": "2026-04-01T13:14:40.362Z"
+  },
+  "AoMAavxFnUvGgy5uG6HFjs5dWjjVdkF4dFY5gCbgR2pt": {
+    "label": "known dev",
+    "reason": "Deployer wallet identified, should be blocked",
+    "added_at": "2026-04-03T09:37:54.278Z"
+  }
+}

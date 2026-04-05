@@ -9,13 +9,15 @@ import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
+import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled, createLiveMessage } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
-import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { getTokenNarrative, getTokenInfo, getTokenHolders } from "./tools/token.js";
+import { stageSignals } from "./signal-tracker.js";
+import { getWeightsSummary } from "./signal-weights.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -55,15 +57,174 @@ function buildPrompt() {
 //  CRON DEFINITIONS
 // ═══════════════════════════════════════════
 let _cronTasks = [];
+// ─── Meteora DLMM Pool Detection ──────────────────────────────────────────
+// Strategy: get all DLMM pool addresses for a token directly from Meteora API.
+// Each holder address is then checked against this set — no tag dependency.
+// Fallback: if Meteora API fails, check each unknown holder address individually
+// via pool_address= filter (verifies if an address is a valid DLMM pool).
+const _dlmmPoolAddressCache = new Map(); // mint → { addresses: Set, meta: Map<addr,{bin_step,fee_pct,name}>, expiresAt: number }
+const _dlmmAddrVerifyCache = new Map();  // address → { isDlmm: boolean, expiresAt: number }
+const DLMM_POOL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Fetch all Meteora DLMM pool addresses for a specific token mint.
+// Returns a Set of pool addresses (empty if API unavailable).
+// Also caches pool metadata (bin_step, fee_pct, name) for readable log output.
+async function getMeteoraDlmmPoolAddresses(mint, label = null) {
+  const now = Date.now();
+  const cached = _dlmmPoolAddressCache.get(mint);
+  if (cached && now < cached.expiresAt) return cached.addresses;
+
+  const displayName = label || mint?.slice(0, 8);
+  try {
+    // Use DLMM search API — pool-discovery API does NOT support filter_by=base_token_mint
+    // dlmm.datapi.meteora.ag accepts mint address as query and returns all pools for that token
+    const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    // Filter to only pools where this mint is actually token_x or token_y
+    const pools = (Array.isArray(data?.data) ? data.data : [])
+      .filter(p => p?.token_x?.address === mint || p?.token_y?.address === mint);
+    const addresses = new Set(pools.map(p => p.address).filter(Boolean));
+    // Store pool metadata keyed by address for readable log labels
+    const meta = new Map(pools.map(p => {
+      const rawFee = p.base_fee_percentage ?? p.fee_pct ?? p.base_fee_rate;
+      return [
+        p.address,
+        {
+          bin_step: p.bin_step ?? p.dlmm_params?.bin_step ?? null,
+          fee_pct:  rawFee != null ? Number(rawFee) : null,
+          name:     p.name || null,
+        }
+      ];
+    }));
+    _dlmmPoolAddressCache.set(mint, { addresses, meta, expiresAt: now + DLMM_POOL_CACHE_TTL_MS });
+    log("screening", `Meteora DLMM pool list for ${displayName}: ${addresses.size} pool(s)`);
+    return addresses;
+  } catch (e) {
+    log("screening_warn", `Meteora pool list unavailable for ${displayName}: ${e.message}`);
+    return new Set();
+  }
+}
+
+// Get a human-readable label for a DLMM pool address using cached metadata.
+// Returns e.g. "100/3" instead of raw address slice.
+function getDlmmPoolLabel(address, mint) {
+  const cached = mint ? _dlmmPoolAddressCache.get(mint) : null;
+  const meta = cached?.meta?.get(address);
+  if (meta) {
+    const parts = [];
+    if (meta.bin_step != null) parts.push(meta.bin_step);
+    if (meta.fee_pct != null)  parts.push(`${meta.fee_pct}%`); // Tambahkan simbol %
+    if (parts.length > 0) return parts.join("/");
+    return meta.name || address.slice(0, 8);
+  }
+  return address.slice(0, 8);
+}
+
+// Verify if a single address is a Meteora DLMM pool via pool_address= filter.
+// Used as fallback when the mint-based fetch fails or returns 0 results.
+async function isMeteoraDlmmPool(address) {
+  const now = Date.now();
+  const cached = _dlmmAddrVerifyCache.get(address);
+  if (cached && now < cached.expiresAt) return cached.isDlmm;
+
+  try {
+    const url = `https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&timeframe=5m&filter_by=${encodeURIComponent(`pool_address=${address}`)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) { _dlmmAddrVerifyCache.set(address, { isDlmm: false, expiresAt: now + DLMM_POOL_CACHE_TTL_MS }); return false; }
+    const data = await res.json();
+    const isDlmm = (data.data || []).length > 0;
+    _dlmmAddrVerifyCache.set(address, { isDlmm, expiresAt: now + DLMM_POOL_CACHE_TTL_MS });
+    return isDlmm;
+  } catch {
+    return false;
+  }
+}
+
+// Compute total DLMM supply % held by ALL Meteora DLMM pools in holder list.
+// knownDlmmAddresses: Set from getMeteoraDlmmPoolAddresses (may be empty if API failed).
+// knownPoolAddr: the specific pool we're evaluating/holding (always include this one).
+function computeDlmmSupplyPct(holders, knownDlmmAddresses, knownPoolAddr = null) {
+  const dlmmHolders = holders.filter(h => {
+    // Primary: exact match against Meteora-verified pool address list
+    if (knownDlmmAddresses.has(h.address)) return true;
+    // Always include the specific pool address we know about (100% reliable)
+    if (knownPoolAddr && h.address === knownPoolAddr) return true;
+    // Do NOT include holders we can't verify — avoids false positives from
+    // Raydium/Orca/PumpAMM pools that may have is_pool=true but are not DLMM
+    return false;
+  });
+
+  const totalPct = Math.round(
+    dlmmHolders.reduce((sum, h) => sum + (h.pct ?? h.percent ?? 0), 0) * 100
+  ) / 100;
+  const sorted = [...dlmmHolders].sort((a, b) => (b.pct ?? b.percent ?? 0) - (a.pct ?? a.percent ?? 0));
+  const method = knownDlmmAddresses.size > 0 ? "meteora-api" : knownPoolAddr ? "pool-addr-only" : "none";
+
+  return {
+    pct: totalPct,
+    poolCount: dlmmHolders.length,
+    topHolder: sorted[0] ?? null,
+    allHolders: dlmmHolders,
+    detectionMethod: method,
+  };
+}
+
+// For holders with is_pool=true that are NOT in knownDlmmAddresses,
+// verify them individually against Meteora API (parallel, best-effort).
+// Returns updated knownDlmmAddresses with any confirmed DLMM pools added.
+async function verifyUnknownPoolHolders(holders, knownDlmmAddresses) {
+  const unknownPools = holders.filter(h =>
+    h.is_pool === true && !knownDlmmAddresses.has(h.address)
+  );
+  if (unknownPools.length === 0) return knownDlmmAddresses;
+
+  const results = await Promise.allSettled(
+    unknownPools.map(h => isMeteoraDlmmPool(h.address))
+  );
+  const verified = new Set(knownDlmmAddresses);
+  unknownPools.forEach((h, i) => {
+    if (results[i].status === "fulfilled" && results[i].value === true) {
+      verified.add(h.address);
+    }
+  });
+  return verified;
+}
+
+
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+const _peakConfirmTimers = new Map();
+const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
+const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
   if (!text) return text;
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
+
+function schedulePeakConfirmation(positionAddress) {
+  if (!positionAddress || _peakConfirmTimers.has(positionAddress)) return;
+
+  const timer = setTimeout(async () => {
+    _peakConfirmTimers.delete(positionAddress);
+    try {
+      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      const position = result?.positions?.find((p) => p.position === positionAddress);
+      // Gunakan pnl_true_pct untuk konfirmasi peak — konsisten dengan saat queue.
+      // pnl_true_pct dihitung dari initial_value_usd tracked saat deploy, bukan all-time API.
+      const pnlForResolve = position?.pnl_true_pct ?? position?.pnl_pct ?? null;
+      resolvePendingPeak(positionAddress, pnlForResolve, TRAILING_PEAK_CONFIRM_TOLERANCE);
+    } catch (error) {
+      log("state_warn", `Peak confirmation failed for ${positionAddress}: ${error.message}`);
+    }
+  }, TRAILING_PEAK_CONFIRM_DELAY_MS);
+
+  _peakConfirmTimers.set(positionAddress, timer);
 }
 
 async function runBriefing() {
@@ -111,28 +272,88 @@ export async function runManagementCycle({ silent = false } = {}) {
   log("cron", "Starting management cycle");
   let mgmtReport = null;
   let positions = [];
+  let liveMessage = null;
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
+    if (!silent && telegramEnabled()) {
+      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
+    }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
+      mgmtReport = "No open positions. Triggering screening cycle.";
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
-      return null;
+      return mgmtReport;
     }
+
+    // Fetch DLMM supply concentration per position (parallel, best-effort)
+    // Check if Meteora DLMM pool has become a top holder since deploy
+    const dlmmSupplyMap = new Map(); // position → { pct, isTopHolder }
+    await Promise.allSettled(
+      positions.map(async (p) => {
+        const mint = p.base_mint;
+        const poolAddr = p.pool;
+        if (!mint || !poolAddr) return;
+        try {
+          const holderRes = await getTokenHolders({ mint, limit: 30 });
+          const holders = holderRes?.holders ?? [];
+          // Two-layer detection: Meteora API (primary) + tag fallback
+          let knownAddrs = await getMeteoraDlmmPoolAddresses(mint, p.pair);
+          // Verify any is_pool=true holders not in our known set (catches unlisted pools)
+          knownAddrs = await verifyUnknownPoolHolders(holders, knownAddrs);
+          const dlmmResult = computeDlmmSupplyPct(holders, knownAddrs, poolAddr);
+          // Rank of our specific pool among all holders (for display)
+          const allSorted = [...holders].sort((a, b) => (b.pct ?? b.percent ?? 0) - (a.pct ?? a.percent ?? 0));
+          const rank = allSorted.findIndex(h => h.address === poolAddr);
+          dlmmSupplyMap.set(p.position, {
+            pct: dlmmResult.pct,
+            poolCount: dlmmResult.poolCount,
+            topHolder: dlmmResult.topHolder,
+            rank: rank >= 0 ? rank + 1 : null,
+            detectionMethod: dlmmResult.detectionMethod,
+          });
+          if (dlmmResult.pct > 0) {
+            const topLabel = dlmmResult.topHolder
+              ? `${getDlmmPoolLabel(dlmmResult.topHolder.address, mint)} @${dlmmResult.topHolder.pct ?? dlmmResult.topHolder.percent ?? "?"}%`
+              : null;
+            log("cron", `DLMM supply for ${p.pair}: ${dlmmResult.pct}% supply across ${dlmmResult.poolCount} pool(s) [${dlmmResult.detectionMethod}]${topLabel ? ` | largest: ${topLabel}` : ""}`);
+          }
+        } catch { /* best-effort — don't block management */ }
+      })
+    );
 
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
-      recordPositionSnapshot(p.pool, p);
-      return { ...p, recall: recallForPool(p.pool) };
+      // Enrich with OOR direction before snapshotting — pool memory needs this context
+      // so screener can distinguish pump (price above range) from dump (price below range)
+      const enriched = { ...p };
+      if (!p.in_range && p.active_bin != null && p.upper_bin != null && p.lower_bin != null) {
+        if (p.active_bin > p.upper_bin) {
+          enriched.oor_direction = "pump"; // price pumped above range — bullish signal
+        } else if (p.active_bin < p.lower_bin) {
+          enriched.oor_direction = "dump"; // price dumped below range — bearish signal
+        }
+      } else {
+        enriched.oor_direction = null;
+      }
+      recordPositionSnapshot(p.pool, enriched);
+      return { ...enriched, recall: recallForPool(p.pool) };
     });
 
     // JS trailing TP check
     const exitMap = new Map();
     for (const p of positionData) {
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
+      // Pakai pnl_true_pct untuk trailing TP — dihitung dari initial_value_usd tracked
+      // saat deploy. Meteora pnlPctChange bisa inflated karena all-time pool deposits
+      // atau fee claims sebelumnya dari posisi lain di pool yang sama.
+      const pnlForTrailing = p.pnl_true_pct ?? p.pnl_pct;
+      if (queuePeakConfirmation(p.position, pnlForTrailing)) {
+        schedulePeakConfirmation(p.position);
+      }
+      const exit = updatePnlAndCheckExits(p.position, { ...p, pnl_pct: pnlForTrailing }, config.management);
       if (exit) {
         exitMap.set(p.position, exit.reason);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
@@ -198,6 +419,22 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "CLOSE", rule: 5, reason: "low yield" });
         continue;
       }
+      // Rule 6: Meteora DLMM pool became top holder since deploy
+      // If the pool holding our liquidity is now a major token holder,
+      // supply is trapped in LP → dump risk. Close and cooldown pool.
+      const dlmmData = dlmmSupplyMap.get(p.position);
+      const maxDlmmPct = config.screening.maxDlmmSupplyPct ?? 2;
+      if (dlmmData && dlmmData.pct > maxDlmmPct) {
+        const rankStr = dlmmData.rank != null ? ` (rank #${dlmmData.rank} holder)` : "";
+        actionMap.set(p.position, {
+          action: "CLOSE",
+          rule: 6,
+          reason: `${dlmmData.poolCount ?? 1} Meteora DLMM pool(s) hold ${dlmmData.pct}% of supply combined${rankStr} — supply trapped in LP [detected via: ${dlmmData.detectionMethod ?? "tag"}]`,
+        });
+        log("cron", `Rule 6 triggered for ${p.pair}: ${dlmmData.poolCount ?? 1} DLMM pool(s) hold ${dlmmData.pct}% of supply combined${rankStr}`);
+        continue;
+      }
+
       // Claim rule
       if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
         actionMap.set(p.position, { action: "CLAIM" });
@@ -216,7 +453,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const dlmmInfo = dlmmSupplyMap.get(p.position);
+      const dlmmLine = dlmmInfo?.pct > 0 ? ` | DLMM: ${dlmmInfo.pct}%×${dlmmInfo.poolCount ?? 1}pool${dlmmInfo.rank ? ` (our pool #${dlmmInfo.rank})` : ""}` : "";
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange}${dlmmLine} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -249,6 +488,7 @@ export async function runManagementCycle({ silent = false } = {}) {
           `  pool: ${p.pool}`,
           `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
           `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+          (() => { const d = dlmmSupplyMap.get(p.position); return d?.pct > 0 ? `  dlmm_supply: ${d.pct}% held by ${d.poolCount ?? 1} Meteora DLMM pool(s) combined${d.rank ? ` (our pool rank #${d.rank})` : ""} — threshold: ${config.screening.maxDlmmSupplyPct ?? 2}%` : null; })(),
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
         ].filter(Boolean).join("\n");
@@ -267,11 +507,15 @@ RULES:
 
 Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048);
+      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+      });
 
       mgmtReport += `\n\n${content}`;
     } else {
       log("cron", "Management: all positions STAY — skipping LLM");
+      await liveMessage?.note("No tool actions needed.");
     }
 
     // Trigger screening after management
@@ -287,7 +531,10 @@ After executing, write a brief one-line result per position.
   } finally {
     _managementBusy = false;
     if (!silent && telegramEnabled()) {
-      if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+      if (mgmtReport) {
+        if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
+        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+      }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
           notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
@@ -308,27 +555,37 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
+  let liveMessage = null;
+  let screenReport = null;
+  let _didDeploy = false; // hoisted so finally block can check
+  let allCandidates = [];
+  let agentMessages = [];
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
+      screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
       _screeningBusy = false;
-      return null;
+      return screenReport;
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
     if (preBalance.sol < minRequired) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
+      screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
       _screeningBusy = false;
-      return null;
+      return screenReport;
     }
   } catch (e) {
     log("cron_error", `Screening pre-check failed: ${e.message}`);
+    screenReport = `Screening pre-check failed: ${e.message}`;
     _screeningBusy = false;
-    return null;
+    return screenReport;
+  }
+  if (!silent && telegramEnabled()) {
+    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
-  let screenReport = null;
   try {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
@@ -345,36 +602,99 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
 
-    const allCandidates = [];
+    allCandidates = [];
     for (const pool of candidates) {
       const mint = pool.base?.mint;
-      const [smartWallets, narrative, tokenInfo] = await Promise.allSettled([
+      const [smartWallets, narrative, tokenInfo, holderData] = await Promise.allSettled([
         checkSmartWalletsOnPool({ pool_address: pool.pool }),
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+        mint ? getTokenHolders({ mint, limit: 30 }) : Promise.resolve(null),
       ]);
+      // ── Meteora DLMM supply concentration (ALL pools for this token) ─────
+      // Two-layer detection:
+      //   1. Primary: Meteora Pool Discovery API → get exact pool addresses for this mint
+      //   2. Fallback: tag-based detection if API unavailable (less reliable for new pools)
+      const rawHolders = holderData.status === "fulfilled" ? (holderData.value?.holders ?? []) : [];
+      // Fetch all DLMM pool addresses for this mint from Meteora API (cached 5min)
+      // Done in parallel with other fetches via holderData — this is a separate fast call
+      let knownDlmmAddrs = mint ? await getMeteoraDlmmPoolAddresses(mint, pool.name) : new Set();
+      // Verify any is_pool=true holders not already in our known set (catches unlisted pools)
+      knownDlmmAddrs = await verifyUnknownPoolHolders(rawHolders, knownDlmmAddrs);
+      // Enrich cache with this pool's own metadata (bin_step, fee_pct) so getDlmmPoolLabel
+      // can produce readable labels (e.g. "bin100/0.25%fee") even when the Meteora API
+      // returned 0 results for this mint (happens with newer/lower-volume tokens).
+      if (mint && pool.pool && pool.bin_step != null) {
+        const feeNum = parseFloat(String(pool.fee_pct || "0").replace("%", ""));
+        const existingCacheEntry = _dlmmPoolAddressCache.get(mint);
+        if (existingCacheEntry) {
+          existingCacheEntry.addresses.add(pool.pool);
+          // Selalu update / timpa data cache dengan data screener yang sudah PASTI punya bin_step & fee
+          existingCacheEntry.meta.set(pool.pool, { bin_step: pool.bin_step, fee_pct: isNaN(feeNum) ? null : feeNum, name: pool.name });
+          knownDlmmAddrs = existingCacheEntry.addresses;
+        } else {
+          const seedMeta = new Map([[pool.pool, { bin_step: pool.bin_step, fee_pct: isNaN(feeNum) ? null : feeNum, name: pool.name }]]);
+          _dlmmPoolAddressCache.set(mint, { addresses: new Set([pool.pool]), meta: seedMeta, expiresAt: Date.now() + DLMM_POOL_CACHE_TTL_MS });
+          knownDlmmAddrs = new Set([pool.pool]);
+        }
+      }
+      const dlmmResult = computeDlmmSupplyPct(rawHolders, knownDlmmAddrs, pool.pool);
+      const dlmmSupplyPct = dlmmResult.pct;
+      const topDlmmHolder = dlmmResult.topHolder;
+      const dlmmPoolCount = dlmmResult.poolCount;
+      const dlmmTopLabel = topDlmmHolder
+        ? `${getDlmmPoolLabel(topDlmmHolder.address, mint)} @${topDlmmHolder.pct ?? topDlmmHolder.percent ?? "?"}%`
+        : null;
+      if (dlmmSupplyPct > 0) {
+        log("screening", `DLMM supply for ${pool.name}: ${dlmmSupplyPct}% supply across ${dlmmPoolCount} pool(s) [${dlmmResult.detectionMethod}]${dlmmTopLabel ? ` | largest: ${dlmmTopLabel}` : ""}`);
+      }
+
       allCandidates.push({
         pool,
+        mint,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
         mem: recallForPool(pool.pool),
+        dlmmSupplyPct,
+        dlmmPoolCount,
+        topDlmmHolder,
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
 
-    // Only filter blocked launchpads — everything else is for the LLM to judge
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
+    const passing = allCandidates.filter(({ pool, mint, ti, dlmmSupplyPct, dlmmPoolCount, topDlmmHolder }) => {
+      // Hard filter: Meteora DLMM pool holds significant supply → dump risk
+      const maxDlmmSupplyPct = config.screening.maxDlmmSupplyPct ?? 2;
+      if (dlmmSupplyPct > maxDlmmSupplyPct) {
+        const topLabel = topDlmmHolder
+          ? `${getDlmmPoolLabel(topDlmmHolder.address, mint)} @${topDlmmHolder.pct ?? topDlmmHolder.percent ?? "?"}%`
+          : null;
+        log("screening", `DLMM supply filter: ${pool.name} — ${dlmmPoolCount} pool(s) hold ${dlmmSupplyPct}% supply (max: ${maxDlmmSupplyPct}%)${topLabel ? ` | largest: ${topLabel}` : ""}`);
+        return false;
+      }
+
       const launchpad = ti?.launchpad ?? null;
+      if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
+        log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
+        return false;
+      }
       if (launchpad && config.screening.blockedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — blocked launchpad (${launchpad})`);
+        return false;
+      }
+      const botPct = ti?.audit?.bot_holders_pct;
+      const maxBotHoldersPct = config.screening.maxBotHoldersPct;
+      if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
+        log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
         return false;
       }
       return true;
     });
 
     if (passing.length === 0) {
-      screenReport = `No candidates available (all blocked by launchpad filter).`;
+      screenReport = `No candidates available (all filtered by launchpad / holder-quality rules).`;
       return screenReport;
     }
 
@@ -384,7 +704,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, mint, sw, n, ti, mem, dlmmSupplyPct, dlmmPoolCount, topDlmmHolder }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
@@ -392,6 +712,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      const dlmmTopLabel = topDlmmHolder
+        ? `${getDlmmPoolLabel(topDlmmHolder.address, mint)} @${topDlmmHolder.pct ?? topDlmmHolder.percent ?? "?"}%`
+        : null;
 
       // OKX signals
       const okxParts = [
@@ -400,7 +723,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pool.sniper_pct     != null ? `sniper=${pool.sniper_pct}%`            : null,
         pool.suspicious_pct != null ? `suspicious=${pool.suspicious_pct}%`    : null,
         pool.new_wallet_pct != null ? `new_wallets=${pool.new_wallet_pct}%`   : null,
+        pool.is_rugpull != null ? `rugpull=${pool.is_rugpull ? "YES" : "NO"}` : null,
+        pool.is_wash != null ? `wash=${pool.is_wash ? "YES" : "NO"}` : null,
       ].filter(Boolean).join(", ");
+      const okxUnavailable = !okxParts && pool.price_vs_ath_pct == null;
 
       const okxTags = [
         pool.smart_money_buy    ? "smart_money_buy"    : null,
@@ -409,24 +735,51 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pool.dex_screener_paid  ? "dex_screener_paid"  : null,
         pool.dev_sold_all       ? "dev_sold_all(bullish)" : null,
       ].filter(Boolean).join(", ");
+      const pvpLine = pool.is_pvp
+        ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
+        : null;
 
-      return [
+      const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        dlmmSupplyPct > 0
+          ? `  dlmm_supply: ${dlmmSupplyPct}% held by ${dlmmPoolCount} Meteora DLMM pool(s)${dlmmTopLabel ? ` (largest: ${dlmmTopLabel})` : ""}${dlmmSupplyPct >= 1 ? " ⚠️ approaching limit" : ""}`
+          : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
-        okxParts ? `  okx: ${okxParts}` : null,
+        pvpLine,
+        okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags  ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
+        `  chart: call get_price_analysis(pool_address="${pool.pool}", pool_name="${pool.name}", bin_step=${pool.bin_step}) before deploying — use result to set bins_below and adjust strategy`,
         mem ? `  memory: ${mem}` : null,
+        mem && mem.includes("all pump") ? `  ⚠️ NOTE: Past OOR in this pool was due to PUMP (price rose above range) — not a loss signal. Token was bullish.` : null,
+        mem && mem.includes("all dump") ? `  ⚠️ NOTE: Past OOR in this pool was due to DUMP (price fell below range) — genuine bearish signal.` : null,
       ].filter(Boolean).join("\n");
+
+      // Stage signals for Darwinian weighting — captured before LLM decides
+      if (config.darwin?.enabled) {
+        stageSignals(pool.pool, {
+          organic_score:         pool.organic_score         ?? null,
+          fee_tvl_ratio:         pool.fee_active_tvl_ratio  ?? null,
+          volume:                pool.volume_window         ?? null,
+          mcap:                  pool.mcap                  ?? null,
+          holder_count:          ti?.holders                ?? null,
+          smart_wallets_present: (sw?.in_pool?.length ?? 0) > 0,
+          narrative_quality:     n?.narrative ? "present" : "absent",
+          volatility:            pool.volatility            ?? null,
+        });
+      }
+
+      return block;
     });
 
-    const { content } = await agentLoop(`
-SCREENING CYCLE
+    const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+
+    const agentResult = await agentLoop(`
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
@@ -435,24 +788,166 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
-2. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(35 + (volatility/5)*55) clamped to [35,90].
-3. Report in this exact format (no tables, no extra sections):
-   Deployed: PAIR
-   bin_step=X | fee=X% | bots=X% | top10=X% | fees=XSOL
-   range=minPrice→maxPrice (downside=(minPrice/maxPrice-1)*100%)
-   smart_wallets=name1,name2 (or none)
-   narrative: <one sentence>
-   reason: <one sentence why picked over others>
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048);
-    screenReport = content;
+2. Call get_price_analysis for the chosen pool (pool_address, pool_name=<pool name>, bin_step from metrics, timeframe="15m", candle_count=100).
+   Use the result to:
+   - Set bins_below: prefer degen_play.bins_below if available, else use round(35 + (volatility/5)*55) clamped to [35,90]
+   - If dump_signals.is_dump=true → skip this pool and pick the next best candidate instead
+   - If trend=downtrend AND confidence=high → increase bins_below by 20% for wider downside buffer
+   - If good_entry=false → note it in the report but still deploy unless dump signals present
+3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
+4. Report in this exact format (no tables, no extra sections):
+   🚀 DEPLOYED
+
+   <pool name>
+   <pool address>
+
+   ◎ <deploy amount> SOL | <strategy> | bin <active_bin>
+   Range: <minPrice> → <maxPrice>
+   Downside buffer: <negative %>
+
+   MARKET
+   Fee/TVL: <x>%
+   Volume: $<x>
+   TVL: $<x>
+   Volatility: <x>
+   Organic: <x>
+   Mcap: $<x>
+   Age: <x>h
+
+   AUDIT
+   Top10: <x>%
+   Bots: <x>%
+   Fees paid: <x> SOL
+   Smart wallets: <names or none>
+
+   RISK
+   <If OKX advanced/risk data exists, list only the fields that actually exist: Risk level, Bundle, Sniper, Suspicious, ATH distance, Rugpull, Wash.>
+   <If only rugpull/wash exist, list just those.>
+   <If OKX enrichment is missing, write exactly: OKX: unavailable>
+
+   CHART
+   Trend: <trend> (<confidence>) | Change: <period_change_pct>%
+   EMA8: <ema8_last> | EMA21: <ema21_last> | Above EMA21 (last 10): <above_ema21_last10>/10
+   Support: <support[0].price> (<strength>) | Resistance: <resistance[0].price>
+   <If more support/resistance levels exist, list up to 2 each>
+   <If dump signals: ⚠️ DUMP: <signals list> | Drawdown from peak: <drawdown_from_peak>%>
+   Range: <lower_pct>% → 0% | Bins: <bins_below> | Entry: <good_entry> | Risk: <risk_level>
+   <entry_note from degen_play>
+
+   WHY THIS WON
+   <2-4 concise sentences on why this pool won, key risks, and why it still beat the alternatives>
+4. If no pool qualifies, report in this exact format instead:
+   ⛔ NO DEPLOY
+
+   Cycle finished with no valid entry.
+
+   BEST LOOKING CANDIDATE
+   <name or none>
+
+   WHY SKIPPED
+   <2-4 concise sentences explaining why nothing was good enough>
+
+   REJECTED
+   <short flat list of top candidate names and why they were skipped>
+IMPORTANT:
+- Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
+- Keep the whole report compact and highly scannable for Telegram.
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+      });
+    const { content, didDeploy, messages: loopMessages } = agentResult;
+    _didDeploy = didDeploy;
+    agentMessages = loopMessages || [];
+
+    // ── Verify deploy via state.json — avoids API indexing race condition ──────
+    // didDeploy is only true when deploy_position returned success=true (checked in agent.js).
+    // A failed tx (simulation error, insufficient funds, etc.) sets didDeploy=false,
+    // so we never trigger a false hallucination warning for genuine tx failures.
+    //
+    // We still verify against state.json as a secondary guard against edge cases where
+    // the tool returned success=true but trackPosition() somehow wasn't called.
+    if (didDeploy) {
+      // Extract position address from successful tool result (already guaranteed by agent.js)
+      const deployedPositionId = (() => {
+        for (const m of (agentMessages || [])) {
+          if (m.role === "tool" && m.content) {
+            try {
+              const r = JSON.parse(m.content);
+              if (r.success === true && r.position && r.pool) return r.position;
+            } catch {}
+          }
+        }
+        return null;
+      })();
+
+      const confirmedInState = deployedPositionId
+        ? !!getTrackedPosition(deployedPositionId)
+        : false;
+
+      if (!confirmedInState) {
+        // deploy_position returned success=true but position not in state — edge case/bug
+        log("cron_warn", `Deploy confirmed by tool but position ${deployedPositionId ?? "unknown"} not found in state.json — possible trackPosition failure.`);
+        screenReport = `⚠️ Screening warning: deploy succeeded on-chain but position not confirmed in state. Check logs.`;
+      } else {
+        // Confirmed real deploy — send separate deploy notification immediately
+        screenReport = content;
+        if (!silent && telegramEnabled()) {
+          sendMessage(`✅ Deployed\n\n${stripThink(content)}`).catch(() => {});
+        }
+      }
+    } else {
+      screenReport = content;
+    }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
     if (!silent && telegramEnabled()) {
-      if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+      if (screenReport) {
+          const isWarning = _didDeploy && screenReport && screenReport.startsWith("⚠️");
+          
+          let candSummary = "";
+          if (_didDeploy && !isWarning && allCandidates.length > 0) {
+             const list = allCandidates.map(c => {
+                let isWinner = false;
+                for (const m of agentMessages) {
+                   if (m.role === "assistant" && m.tool_calls) {
+                      for (const tc of m.tool_calls) {
+                         if (tc.function.name === "deploy_position") {
+                            try {
+                               const args = JSON.parse(tc.function.arguments);
+                               if (args.pool_address === c.pool.pool || args.pool_name === c.pool.name) {
+                                  isWinner = true;
+                               }
+                            } catch(e) {}
+                         }
+                      }
+                   }
+                }
+                
+                const volRaw = c.pool.volume_window || 0;
+                const vol = volRaw >= 1000 ? (volRaw/1000).toFixed(1) + "k" : Math.round(volRaw);
+                const feeTvl = c.pool.fee_active_tvl_ratio || 0;
+                
+                return `• ${c.pool.name || "Unknown"} (Org: ${c.pool.organic_score ?? 0}, Vol: $${vol}, Yield: ${feeTvl}%) — ${isWinner ? "✅ DEPLOYED" : "❌ SKIPPED"}`;
+             }).join("\n");
+             
+             candSummary = `\n\nTop Candidates Evaluated:\n${list}\n\n💡 Note: SKIPPED candidates above all passed system thresholds. They were bypassed because the AI selected the single best pool based on narrative and overall conviction.`;
+          }
+
+          const telegramText = isWarning
+            ? screenReport  
+            : (_didDeploy ? `✅ Deploy confirmed — see report below.${candSummary}` : stripThink(screenReport));
+            
+          if (telegramText) {
+          if (liveMessage) await liveMessage.finalize(telegramText).catch(() => {});
+          else sendMessage(`🔍 Screening Cycle\n\n${telegramText}`).catch(() => { });
+        } else if (liveMessage) {
+          await liveMessage.finalize("🔍 Screening complete.").catch(() => {});
+        }
+      }
     }
   }
   return screenReport;
@@ -496,7 +991,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
+// Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
@@ -505,7 +1000,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        const pnlForTrailingPoll = p.pnl_true_pct ?? p.pnl_pct;
+        if (queuePeakConfirmation(p.position, pnlForTrailingPoll)) {
+          schedulePeakConfirmation(p.position);
+        }
+        const exit = updatePnlAndCheckExits(p.position, { ...p, pnl_pct: pnlForTrailingPoll }, config.management);
         if (exit) {
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
@@ -588,6 +1087,117 @@ function appendHistory(userMsg, assistantMsg) {
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
+// Telegram bot — queue messages received while busy, drain after each task
+async function drainTelegramQueue() {
+  while (_telegramQueue.length > 0 && !_managementBusy && !_screeningBusy && !busy) {
+    const queued = _telegramQueue.shift();
+    await telegramHandler(queued);
+  }
+}
+
+async function telegramHandler(text) {
+  if (_managementBusy || _screeningBusy || busy) {
+    if (_telegramQueue.length < 5) {
+      _telegramQueue.push(text);
+      sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
+    } else {
+      sendMessage("Queue is full (5 messages). Wait for the agent to finish.").catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/briefing") {
+    try {
+      const briefing = await generateBriefing();
+      await sendHTML(briefing);
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => { });
+    }
+    return;
+  }
+
+  if (text === "/positions") {
+    try {
+      const { positions, total_positions } = await getMyPositions({ force: true });
+      if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      const cur = config.management.solMode ? "◎" : "$";
+      const lines = positions.map((p, i) => {
+        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+        const oor = !p.in_range ? " ⚠️OOR" : "";
+        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+      });
+      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
+    return;
+  }
+
+  const closeMatch = text.match(/^\/close\s+(\d+)$/i);
+  if (closeMatch) {
+    try {
+      const idx = parseInt(closeMatch[1]) - 1;
+      const { positions } = await getMyPositions({ force: true });
+      if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
+      const pos = positions[idx];
+      await sendMessage(`Closing ${pos.pair}...`);
+      const result = await closePosition({ position_address: pos.position });
+      if (result.success) {
+        const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
+        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+      } else {
+        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+      }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
+    return;
+  }
+
+  const setMatch = text.match(/^\/set\s+(\d+)\s+(.+)$/i);
+  if (setMatch) {
+    try {
+      const idx = parseInt(setMatch[1]) - 1;
+      const note = setMatch[2].trim();
+      const { positions } = await getMyPositions({ force: true });
+      if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
+      const pos = positions[idx];
+      setPositionInstruction(pos.position, note);
+      await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
+    return;
+  }
+
+  busy = true;
+  let liveMessage = null;
+  try {
+    log("telegram", `Incoming: ${text}`);
+    const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
+    const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
+    const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
+    const agentModel = agentRole === "SCREENER" ? config.llm.screeningModel : config.llm.generalModel;
+    liveMessage = await createLiveMessage("🤖 Live Update", `Request: ${text.slice(0, 240)}`);
+    const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, agentModel, null, {
+      interactive: true,
+      onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+      onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+    });
+    appendHistory(text, content);
+    if (liveMessage) await liveMessage.finalize(stripThink(content));
+    else await sendMessage(stripThink(content));
+  } catch (e) {
+    if (liveMessage) await liveMessage.fail(e.message).catch(() => {});
+    else await sendMessage(`Error: ${e.message}`).catch(() => { });
+  } finally {
+    busy = false;
+    if (typeof rl !== "undefined") {
+      rl.setPrompt(buildPrompt());
+      rl.prompt(true);
+    }
+    drainTelegramQueue().catch(() => {});
+  }
+}
+
+
+
 if (isTTY) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -669,102 +1279,6 @@ if (isTTY) {
   // Always start autonomous cycles on launch
   launchCron();
   maybeRunMissedBriefing().catch(() => { });
-
-  // Telegram bot — queue messages received while busy, drain after each task
-  async function drainTelegramQueue() {
-    while (_telegramQueue.length > 0 && !_managementBusy && !_screeningBusy && !busy) {
-      const queued = _telegramQueue.shift();
-      await telegramHandler(queued);
-    }
-  }
-
-  async function telegramHandler(text) {
-    if (_managementBusy || _screeningBusy || busy) {
-      if (_telegramQueue.length < 5) {
-        _telegramQueue.push(text);
-        sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
-      } else {
-        sendMessage("Queue is full (5 messages). Wait for the agent to finish.").catch(() => {});
-      }
-      return;
-    }
-
-    if (text === "/briefing") {
-      try {
-        const briefing = await generateBriefing();
-        await sendHTML(briefing);
-      } catch (e) {
-        await sendMessage(`Error: ${e.message}`).catch(() => { });
-      }
-      return;
-    }
-
-    if (text === "/positions") {
-      try {
-        const { positions, total_positions } = await getMyPositions({ force: true });
-        if (total_positions === 0) { await sendMessage("No open positions."); return; }
-        const cur = config.management.solMode ? "◎" : "$";
-        const lines = positions.map((p, i) => {
-          const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
-          const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
-          const oor = !p.in_range ? " ⚠️OOR" : "";
-          return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
-        });
-        await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
-      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
-      return;
-    }
-
-    const closeMatch = text.match(/^\/close\s+(\d+)$/i);
-    if (closeMatch) {
-      try {
-        const idx = parseInt(closeMatch[1]) - 1;
-        const { positions } = await getMyPositions({ force: true });
-        if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
-        const pos = positions[idx];
-        await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position });
-        if (result.success) {
-          await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | txs: ${result.txs?.join(", ")}`);
-        } else {
-          await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
-        }
-      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
-      return;
-    }
-
-    const setMatch = text.match(/^\/set\s+(\d+)\s+(.+)$/i);
-    if (setMatch) {
-      try {
-        const idx = parseInt(setMatch[1]) - 1;
-        const note = setMatch[2].trim();
-        const { positions } = await getMyPositions({ force: true });
-        if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
-        const pos = positions[idx];
-        setPositionInstruction(pos.position, note);
-        await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
-      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
-      return;
-    }
-
-    busy = true;
-    try {
-      log("telegram", `Incoming: ${text}`);
-      const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
-      const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
-      const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
-      const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, agentRole, config.llm.generalModel);
-      appendHistory(text, content);
-      await sendMessage(stripThink(content));
-    } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => { });
-    } finally {
-      busy = false;
-      rl.setPrompt(buildPrompt());
-      rl.prompt(true);
-      drainTelegramQueue().catch(() => {});
-    }
-  }
 
   startPolling(telegramHandler);
 
@@ -968,7 +1482,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
     // ── Free-form chat ───────────────────────
     await runBusy(async () => {
       log("user", input);
-      const { content } = await agentLoop(input, config.llm.maxSteps, sessionHistory, "GENERAL", config.llm.generalModel);
+      const { content } = await agentLoop(input, config.llm.maxSteps, sessionHistory, "GENERAL", config.llm.generalModel, null, { interactive: true });
       appendHistory(input, content);
       console.log(`\n${content}\n`);
     });
@@ -981,14 +1495,9 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
   maybeRunMissedBriefing().catch(() => { });
-  (async () => {
-    try {
-      await agentLoop(`
-STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL. 4. Report.
-      `, config.llm.maxSteps, [], "SCREENER");
-    } catch (e) {
-      log("startup_error", e.message);
-    }
-  })();
+  startPolling(telegramHandler);
+  // Startup deploy: run full runScreeningCycle() so chart.js pre-fetch,
+  // DLMM supply checks, and all recon are included — same as cron screening.
+  // Balance/position guards are already inside runScreeningCycle itself.
+  runScreeningCycle({ silent: false }).catch(e => log("startup_error", e.message));
 }

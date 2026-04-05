@@ -11,9 +11,9 @@ Pools are pre-filtered for safety:
 - No critical warnings on base/quote tokens
 - No high single ownership on base token
 - Base token market cap >= $150k
-- Base token holders >= 100
-- Volume >= $1k (in timeframe)
-- Active TVL >= $10k
+- Base token holders >= 500
+- Volume >= $500 (in timeframe)
+- Active TVL >= $5k
 - Fee/Active TVL ratio >= 0.01 (in timeframe)
 - Both tokens organic score >= 60
 
@@ -31,8 +31,8 @@ Use this as the primary tool for finding new LP opportunities.`,
           },
           timeframe: {
             type: "string",
-            enum: ["1h", "4h", "12h", "24h"],
-            description: "Timeframe for metrics. Use 24h for general screening, 1h for momentum."
+            enum: ["5m", "30m", "1h", "4h", "12h", "24h"],
+            description: "Timeframe for metrics. Use 30m for general screening, 5m for momentum."
           },
           category: {
             type: "string",
@@ -136,7 +136,7 @@ HARD RULES:
 
 Guidelines (only when user hasn't specified):
 - Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
-- Bins: choose 35–69 for standard volatility; up to 350 for wide-range strategies. Max 1400 total.
+- Bins: choose 40–69 for standard volatility; up to 350 for wide-range strategies. Max 1400 total.
 - Deposit: Can be single-sided (SOL only or Base only) or dual-sided.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
@@ -174,6 +174,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
+          quote_mint: { type: "string", description: "Quote token mint address (e.g. SOL/wSOL mint). ALWAYS pass this — safety check uses it to block SOL-only deploys into non-SOL-quoted pools (e.g. USDC pairs)." },
+          quote_symbol: { type: "string", description: "Quote token symbol (e.g. 'SOL', 'USDC'). Pass alongside quote_mint for readable error messages." },
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
           volatility: { type: "number", description: "Pool volatility at deploy time" },
@@ -258,7 +260,7 @@ WARNING: This executes a real on-chain transaction.`,
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.
 Use when:
-- Position has been out of range for > 30 minutes
+- Position has been out of range for > 15 minutes
 - IL exceeds accumulated fees
 - Token shows danger signals (organic score drop, volume crash)
 - Rebalancing (close old + open new)
@@ -372,8 +374,8 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitFeePct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads, minTokenAgeHours, maxTokenAgeHours, athFilterPct
+Management: minClaimAmount, autoSwapAfterClaim, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, solMode, minSolToOpen, deployAmountSol, gasReserve, positionSizePct, minFeePerTvl24h
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
@@ -1069,6 +1071,118 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
       parameters: {
         type: "object",
         properties: {}
+      }
+    }
+  },
+
+
+  // ─── Price Analysis ────────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "get_price_analysis",
+      description: `Analyze price action for a pool using Meteora native OHLCV data. No API key required.
+
+Returns:
+- Support/resistance levels (key price zones from recent price history)
+- Trend direction: uptrend / downtrend / ranging
+- Dump/rug detection signals (sudden volume spike + price crash pattern)
+- Recommended deploy range based on recent volatility
+- Whether current price is near support (good entry) or resistance (risky entry)
+
+Use this BEFORE deploying to assess entry quality. Also use when a pool shows suspicious activity to detect rug signals before they happen.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Pool address to analyze"
+          },
+          timeframe: {
+            type: "string",
+            enum: ["1m", "5m", "15m", "30m", "1h", "4h"],
+            description: "Candle timeframe. Default 15m for pre-deploy screening. Use 1h for broader trend."
+          },
+          candle_count: {
+            type: "number",
+            description: "Number of candles to analyze. Default 100, max 300."
+          },
+          bin_step: {
+            type: "number",
+            description: "Pool bin step — calibrates range recommendation to actual pool granularity."
+          },
+          token_age_hours: {
+            type: "number",
+            description: "Token age in hours — adjusts dump detection sensitivity for new tokens."
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  // ─── Knowledge Graph ───────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "build_knowledge_graph",
+      description: `Build a comprehensive knowledge graph aggregating all agent history.
+
+Combines: open/closed positions, pool memory, lessons, strategy patterns, nugget memory.
+Returns nodes, edges, and cross-referenced insights.
+
+Use when the user asks for a full portfolio analysis, wants to understand which strategies work, or asks for a structured summary of all past decisions and patterns.`,
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
+
+  // ─── Nuggets Memory ────────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "remember_fact",
+      description: "Store a fact in the agent's cross-session nugget memory. Use to remember things that should persist beyond lessons — e.g. pool-specific notes, strategy insights, operator preferences.",
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Nugget name: 'pools', 'strategies', 'patterns', or 'lessons'" },
+          key:    { type: "string", description: "Short identifier key (e.g. 'BONK-SOL-bid_ask')" },
+          value:  { type: "string", description: "The fact or insight to store (max 200 chars)" }
+        },
+        required: ["nugget", "key", "value"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: "Recall facts from cross-session nugget memory using semantic search. Use when you need to remember something about a pool, strategy, or past pattern that may be relevant to the current task.",
+      parameters: {
+        type: "object",
+        properties: {
+          query:  { type: "string", description: "What to look for — e.g. 'bid_ask performance', 'BONK pool history'" },
+          nugget: { type: "string", description: "Optional: limit search to a specific nugget (pools/strategies/patterns/lessons)" }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "forget_fact",
+      description: "Remove a specific fact from nugget memory (e.g. outdated pool note, wrong strategy entry).",
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Nugget name: 'pools', 'strategies', 'patterns', or 'lessons'" },
+          key:    { type: "string", description: "The key to remove" }
+        },
+        required: ["nugget", "key"]
       }
     }
   },

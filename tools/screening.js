@@ -2,10 +2,92 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
+import { isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const PVP_SHORTLIST_LIMIT = 2;
+const PVP_RIVAL_LIMIT = 2;
+const PVP_MIN_ACTIVE_TVL = 5_000;
+const PVP_MIN_HOLDERS = 500;
+const PVP_MIN_GLOBAL_FEES_SOL = 15;
+
+function normalizeSymbol(symbol) {
+  return String(symbol || "").trim().toUpperCase();
+}
+
+function scoreCandidate(pool) {
+  const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
+  const organic = Number(pool.organic_score || 0);
+  const volume = Number(pool.volume_window || 0);
+  const holders = Number(pool.holders || 0);
+  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+}
+
+async function searchAssetsBySymbol(symbol) {
+  const res = await fetch(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
+  if (!res.ok) throw new Error(`assets/search ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data) ? data : [data];
+}
+
+async function findRivalPool(mint) {
+  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`rival pool search ${res.status}`);
+  const data = await res.json();
+  const pools = Array.isArray(data?.data) ? data.data : [];
+  return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
+}
+
+async function enrichPvpRisk(pools) {
+  const shortlist = [...pools]
+    .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
+    .slice(0, PVP_SHORTLIST_LIMIT);
+
+  if (shortlist.length === 0) return;
+
+  const symbolCache = new Map();
+
+  await Promise.all(shortlist.map(async (pool) => {
+    const symbol = normalizeSymbol(pool.base?.symbol);
+    const ownMint = pool.base?.mint;
+    if (!symbol || !ownMint) return;
+
+    let assets = symbolCache.get(symbol);
+    if (!assets) {
+      assets = await searchAssetsBySymbol(symbol).catch(() => []);
+      symbolCache.set(symbol, assets);
+    }
+
+    const rivalAssets = assets
+      .filter((asset) => normalizeSymbol(asset?.symbol) === symbol && asset?.id && asset.id !== ownMint)
+      .sort((a, b) => Number(b?.liquidity || 0) - Number(a?.liquidity || 0))
+      .slice(0, PVP_RIVAL_LIMIT);
+
+    for (const rival of rivalAssets) {
+      const rivalHolders = Number(rival?.holderCount || 0);
+      const rivalFees = Number(rival?.fees || 0);
+      if (rivalHolders < PVP_MIN_HOLDERS || rivalFees < PVP_MIN_GLOBAL_FEES_SOL) continue;
+
+      const rivalPool = await findRivalPool(rival.id).catch(() => null);
+      if (!rivalPool) continue;
+
+      pool.is_pvp = true;
+      pool.pvp_risk = "high";
+      pool.pvp_symbol = pool.base?.symbol || symbol;
+      pool.pvp_rival_name = rival?.name || pool.pvp_symbol;
+      pool.pvp_rival_mint = rival.id;
+      pool.pvp_rival_pool = rivalPool.address;
+      pool.pvp_rival_tvl = round(Number(rivalPool.tvl || 0));
+      pool.pvp_rival_holders = rivalHolders;
+      pool.pvp_rival_fees = Number(rivalFees.toFixed(2));
+      log("screening", `PVP guard: ${pool.name} has active rival ${pool.pvp_rival_name} (${rival.id.slice(0, 8)})`);
+      break;
+    }
+  }));
+}
 
 
 
@@ -20,6 +102,7 @@ export async function discoverPools({
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
+    s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
     `base_token_market_cap>=${s.minMcap}`,
@@ -27,14 +110,17 @@ export async function discoverPools({
     `base_token_holders>=${s.minHolders}`,
     `volume>=${s.minVolume}`,
     `tvl>=${s.minTvl}`,
-    `tvl<=${s.maxTvl}`,
+    s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
     `dlmm_bin_step>=${s.minBinStep}`,
     `dlmm_bin_step<=${s.maxBinStep}`,
     `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
     `base_token_organic_score>=${s.minOrganic}`,
-    "quote_token_organic_score>=60",
+    `quote_token_organic_score>=${s.minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
     s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
+    Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
+      ? `base_token_launchpad=[${s.allowedLaunchpads.join(",")}]`
+      : null,
   ].filter(Boolean).join("&&");
 
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
@@ -123,22 +209,62 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
   const eligible = pools
-    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
+    .filter((p) => {
+      if (occupiedPools.has(p.pool) || occupiedMints.has(p.base?.mint)) return false;
+      if (isPoolOnCooldown(p.pool)) {
+        log("screening", `Filtered cooldown pool ${p.name} (${p.pool.slice(0, 8)})`);
+        return false;
+      }
+      if (isBaseMintOnCooldown(p.base?.mint)) {
+        log("screening", `Filtered cooldown token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
+        return false;
+      }
+      return true;
+    })
     .slice(0, limit);
+
+  if (config.screening.avoidPvpSymbols && eligible.length > 0) {
+    await enrichPvpRisk(eligible);
+    if (config.screening.blockPvpSymbols) {
+      const before = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => !p.is_pvp));
+      if (eligible.length < before) {
+        log("screening", `PVP hard filter removed ${before - eligible.length} pool(s)`);
+      }
+    }
+  }
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
-    const { getAdvancedInfo, getPriceInfo, getClusterList } = await import("./okx.js");
+    const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
     const okxResults = await Promise.allSettled(
-      eligible.map((p) => p.base?.mint
-        ? Promise.all([getAdvancedInfo(p.base.mint), getPriceInfo(p.base.mint), getClusterList(p.base.mint)])
-        : Promise.resolve([null, null, []])
-      )
+      eligible.map(async (p) => {
+        if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
+        const [adv, price, clusters, risk] = await Promise.allSettled([
+          getAdvancedInfo(p.base.mint),
+          getPriceInfo(p.base.mint),
+          getClusterList(p.base.mint),
+          getRiskFlags(p.base.mint),
+        ]);
+
+        const mintShort = p.base.mint.slice(0, 8);
+        if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
+        if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
+        if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
+        if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
+
+        return {
+          adv: adv.status === "fulfilled" ? adv.value : null,
+          price: price.status === "fulfilled" ? price.value : null,
+          clusters: clusters.status === "fulfilled" ? clusters.value : [],
+          risk: risk.status === "fulfilled" ? risk.value : null,
+        };
+      })
     );
     for (let i = 0; i < eligible.length; i++) {
       const r = okxResults[i];
       if (r.status !== "fulfilled") continue;
-      const [adv, price, clusters] = r.value;
+      const { adv, price, clusters, risk } = r.value;
       if (adv) {
         eligible[i].risk_level      = adv.risk_level;
         eligible[i].bundle_pct      = adv.bundle_pct;
@@ -149,6 +275,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].dex_boost       = adv.dex_boost;
         eligible[i].dex_screener_paid = adv.dex_screener_paid;
         if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
+      }
+      if (risk) {
+        eligible[i].is_rugpull = risk.is_rugpull;
+        eligible[i].is_wash    = risk.is_wash;
       }
       if (price) {
         eligible[i].price_vs_ath_pct = price.price_vs_ath_pct;
@@ -161,9 +291,16 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
       }
     }
-    // Bundle filter — drop pools where OKX bundle % exceeds threshold
+    // Wash trading hard filter — fake volume = misleading fee yield
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (p.is_wash) { log("screening", `Risk filter: dropped ${p.name} — wash trading flagged`); return false; }
+      return true;
+    }));
+
+    // Bundle filter — high bundle % = concentrated insider ownership risk
     const maxBundle = config.screening.maxBundlePct;
     if (maxBundle != null) {
+      const beforeBundle = eligible.length;
       eligible.splice(0, eligible.length, ...eligible.filter((p) => {
         if (p.bundle_pct != null && p.bundle_pct > maxBundle) {
           log("screening", `Bundle filter: dropped ${p.name} — bundle ${p.bundle_pct}% > ${maxBundle}%`);
@@ -171,6 +308,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         }
         return true;
       }));
+      if (eligible.length < beforeBundle) log("screening", `Bundle filter removed ${beforeBundle - eligible.length} pool(s)`);
     }
 
     // ATH filter — drop pools where price is too close to ATH
@@ -255,7 +393,7 @@ function condensePool(p) {
     },
     pool_type: p.pool_type,
     bin_step: p.dlmm_params?.bin_step || null,
-    fee_pct: p.fee_pct,
+    fee_pct: p.fee_pct + "%",
 
     // Core metrics (the numbers that matter)
     active_tvl: round(p.active_tvl),
@@ -276,6 +414,7 @@ function condensePool(p) {
       ? Math.floor((Date.now() - p.token_x.created_at) / 3_600_000)
       : null,
     dev: p.token_x?.dev || null,
+    launchpad: p.token_x?.launchpad || null,
 
     // Position health
     active_positions: p.active_positions,

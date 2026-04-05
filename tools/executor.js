@@ -16,11 +16,14 @@ import { setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
-import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
+import { addToBlacklist, removeFromBlacklist, listBlacklist, isBlacklisted } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds } from "../config.js";
+import { config } from "../config.js";
+import { getPriceAnalysis } from "./chart.js";
+import { buildKnowledgeGraph } from "./knowledge-graph.js";
+import { rememberFact, recallMemory, forgetFact } from "../memory.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -43,7 +46,7 @@ const toolMap = {
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
   deploy_position: deployPosition,
-  get_my_positions: getMyPositions,
+  get_my_positions: (args) => getMyPositions({ ...(args || {}), force: true }),
   get_wallet_positions: getWalletPositions,
   search_pools: searchPools,
   get_token_info: getTokenInfo,
@@ -99,6 +102,14 @@ const toolMap = {
   block_deployer: blockDev,
   unblock_deployer: unblockDev,
   list_blocked_deployers: listBlockedDevs,
+  // ─── Price Analysis (chart.js) ─────────────────────────────────
+  get_price_analysis: getPriceAnalysis,
+  // ─── Knowledge Graph ───────────────────────────────────────────
+  build_knowledge_graph: buildKnowledgeGraph,
+  // ─── Nuggets Memory ────────────────────────────────────────────
+  remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
+  recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
+  forget_fact:   ({ nugget, key }) => forgetFact(nugget, key),
   add_lesson: ({ rule, tags, pinned, role }) => {
     addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
     return { saved: true, rule, pinned: !!pinned, role: role || "all" };
@@ -126,14 +137,30 @@ const toolMap = {
     return { error: "invalid mode" };
   },
   update_config: ({ changes, reason = "" }) => {
+    // Parameters locked by user — agent cannot change these
+    const LOCKED_PARAMS = {
+      minMcap:         'minMcap is locked at $150k — do not change market cap filter',
+      maxMcap:         'maxMcap is locked at $10M — do not change market cap filter',
+      maxTvl:          'maxTvl is locked at $150k — do not change TVL filter',
+      minHolders:      'minHolders is locked at 500 — do not change holder filter',
+      gasReserve:      'gasReserve is locked at 0.2 SOL — gas reserve cannot be reduced',
+    };
+    const lockedAttempts = Object.keys(changes).filter(k => LOCKED_PARAMS[k]);
+    if (lockedAttempts.length > 0) {
+      const reasons = lockedAttempts.map(k => LOCKED_PARAMS[k]).join('; ');
+      log("config", `update_config BLOCKED locked params: ${lockedAttempts.join(', ')} — ${reasons}`);
+      return { success: false, blocked: lockedAttempts, reason: `Cannot change locked parameters: ${reasons}` };
+    }
     // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+      excludeHighSupplyConcentration: ["screening", "excludeHighSupplyConcentration"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],
       minVolume: ["screening", "minVolume"],
       minOrganic: ["screening", "minOrganic"],
+      minQuoteOrganic: ["screening", "minQuoteOrganic"],
       minHolders: ["screening", "minHolders"],
       minMcap: ["screening", "minMcap"],
       maxMcap: ["screening", "maxMcap"],
@@ -142,9 +169,14 @@ const toolMap = {
       timeframe: ["screening", "timeframe"],
       category: ["screening", "category"],
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
+      avoidPvpSymbols: ["screening", "avoidPvpSymbols"],
+      blockPvpSymbols: ["screening", "blockPvpSymbols"],
       maxBundlePct:     ["screening", "maxBundlePct"],
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
+      allowedLaunchpads: ["screening", "allowedLaunchpads"],
+      maxDlmmSupplyPct:  ["screening", "maxDlmmSupplyPct"],
+      blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
@@ -266,7 +298,9 @@ export async function executeTool(name, args) {
 
   // ─── Pre-execution safety checks ──────────
   if (WRITE_TOOLS.has(name)) {
+    log("safety", `Running safety check for ${name}`);
     const safetyCheck = await runSafetyChecks(name, args);
+    log("safety", `Safety check result: pass=${safetyCheck.pass} reason=${safetyCheck.reason}`);
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -297,10 +331,30 @@ export async function executeTool(name, args) {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        const closeReason = (args.reason || "").toLowerCase();
+        const poolAddr = result.pool || args.pool_address;
         // Note low-yield closes in pool memory so screener avoids redeploying
-        if (args.reason && args.reason.toLowerCase().includes("yield")) {
-          const poolAddr = result.pool || args.pool_address;
-          if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
+        if (closeReason.includes("yield") && poolAddr) {
+          addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
+        }
+        // Note DLMM supply trap closes — recordPoolDeploy handles cooldown, but
+        // we also add an explicit note here for immediate visibility in recallForPool.
+        // The note + lesson combination ensures screener avoids this token for 8h
+        // even before recordPerformance runs (which only fires when close fully settles).
+        if ((closeReason.includes("dlmm") || closeReason.includes("supply trapped")) && poolAddr) {
+          addPoolNote({ pool_address: poolAddr, note: `DLMM supply trap: ${args.reason?.slice(0, 200) || "supply concentrated in Meteora LP"} — ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
+          try {
+            const { addLesson } = await import("./lessons.js");
+            const baseMintLabel = result.base_mint ? result.base_mint.slice(0, 8) : "unknown";
+            addLesson(
+              `AVOID: Token ${result.pool_name || poolAddr.slice(0, 8)} (mint: ${baseMintLabel}...) closed Rule 6 — DLMM pools held >2% supply. Skip all pools with this base mint for 8h.`,
+              ["dlmm_supply", "screening", "token"],
+              { pinned: false, role: "SCREENER" }
+            );
+            log("executor", `Rule 6 close: pool-note + lesson saved for ${result.pool_name || poolAddr.slice(0, 8)} (base mint: ${baseMintLabel}...)`);
+          } catch (e) {
+            log("executor_warn", `Rule 6 lesson save failed: ${e.message}`);
+          }
         }
         // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
@@ -359,6 +413,35 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // Check blacklist before deploy
+      if (args.base_mint) {
+        try {
+          if (isBlacklisted(args.base_mint)) {
+            return { pass: false, reason: `Token ${args.base_mint} is blacklisted. Skipping deploy.` };
+          }
+        } catch (e) { log("safety", `Blacklist check error: ${e.message}`); }
+      }
+
+      // Real-time 5m volume check from Meteora API (min $500)
+      if (args.pool_address) {
+        try {
+          const volRes = await fetch(`https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&filter_by=pool_address%3D${args.pool_address}&timeframe=5m`);
+          if (volRes.ok) {
+            const volData = await volRes.json();
+            const realVol = volData.data?.[0]?.volume ?? null;
+            const _poolLabel = args.pool_name || args.pool_address?.slice(0, 8);
+            log("safety", `Real-time 5m volume for ${_poolLabel}: $${realVol?.toFixed(2) ?? 'N/A'}`);
+            if (realVol == null || realVol < 500) {
+              return { pass: false, reason: `Real-time 5m volume for ${_poolLabel}: $${realVol?.toFixed(2) ?? 'N/A'} — below minimum $500. Skipping deploy.` };
+            }
+          }
+        } catch (e) {
+          const _poolLabel = args.pool_name || args.pool_address?.slice(0, 8);
+          log("safety", `Volume check failed for ${_poolLabel}: ${e.message} — blocking deploy as precaution`);
+          return { pass: false, reason: `Cannot verify real-time volume for ${args.pool_name || args.pool_address?.slice(0, 8)}. Skipping deploy.` };
+        }
+      }
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
@@ -398,6 +481,22 @@ async function runSafetyChecks(name, args) {
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
           };
         }
+      }
+
+      // Block SOL-only deploy into pools where quote token is not SOL/wSOL.
+      // If amount_x=0 (SOL-only) and the pool's quote_mint is not SOL/wSOL,
+      // the tx will always fail with "insufficient funds" on the base token transfer.
+      const SOL_MINTS = new Set([
+        "So11111111111111111111111111111111111111112", // wSOL
+        "SOL",
+      ]);
+      const isSolOnlyDeploy = (args.amount_x == null || args.amount_x === 0);
+      const quoteMint = args.quote_mint;
+      if (isSolOnlyDeploy && quoteMint && !SOL_MINTS.has(quoteMint)) {
+        return {
+          pass: false,
+          reason: `SOL-only deploy blocked: pool quote token is ${args.quote_symbol || quoteMint.slice(0, 8)} (not SOL/wSOL). You need ${args.quote_symbol || "the quote token"} to deploy into this pool, or choose a SOL-quoted pool instead.`,
+        };
       }
 
       // Check amount limits

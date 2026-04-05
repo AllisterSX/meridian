@@ -1,0 +1,74 @@
+{
+  "facts": [
+    {
+      "hits": 36,
+      "key": "PUMPPERPS-SOL",
+      "value": "profitable, PnL 5.3%, range_eff 100%, strategy=bid_ask, bin_step=125, vol=4.39",
+      "last_hit_session": "session_1774850953534",
+      "created_at": "2026-03-29T09:20:00.285Z"
+    },
+    {
+      "hits": 33,
+      "key": "PERK-SOL",
+      "value": "OOR-upside, PnL 0.0%, fees 0 SOL, age 6m",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-29T15:10:00.272Z"
+    },
+    {
+      "hits": 36,
+      "key": "Clippy-SOL",
+      "value": "profitable, PnL 0.1%, range_eff 100%, strategy=bid_ask, bin_step=100, vol=1.64",
+      "last_hit_session": "session_1774859014445",
+      "created_at": "2026-03-29T18:30:00.070Z"
+    },
+    {
+      "hits": 80,
+      "key": "Downald-SOL",
+      "value": "profitable, PnL 0.8%, range_eff 100%, strategy=bid_ask, bin_step=100, vol=null",
+      "last_hit_session": "session_1774859014445",
+      "created_at": "2026-03-29T23:25:00.900Z"
+    },
+    {
+      "hits": 40,
+      "key": "LOL-SOL",
+      "value": "profitable, PnL 2.1%, range_eff 100%, strategy=bid_ask, bin_step=100, vol=1.67",
+      "last_hit_session": "session_1774844722041",
+      "created_at": "2026-03-29T23:50:00.502Z"
+    },
+    {
+      "hits": 18,
+      "key": "MONDAY-SOL",
+      "value": "profitable, PnL 0.0%, range_eff 86%, strategy=bid_ask, bin_step=100, OOR_direction=upside, vol=null",
+      "last_hit_session": "session_1774859014445",
+      "created_at": "2026-03-30T06:10:00.752Z"
+    },
+    {
+      "hits": 16,
+      "key": "-SOL",
+      "value": "profitable, PnL 2.4%, range_eff 100%, strategy=bid_ask, bin_step=100, vol=null",
+      "last_hit_session": "session_1774859014445",
+      "created_at": "2026-03-30T06:10:00.770Z"
+    },
+    {
+      "hits": 0,
+      "key": "Bonk-SOL",
+      "value": "profitable, PnL 0.0%, range_eff 67%, strategy=bid_ask, bin_step=100, OOR_direction=upside, vol=null",
+      "last_hit_session": null,
+      "created_at": "2026-03-30T07:49:32.976Z"
+    },
+    {
+      "hits": 0,
+      "key": "HBibZkagaHoJRaLXHiJn3BbvMgVWqsVGUeR4ytmD",
+      "value": "unprofitable, PnL -20.2%, range_eff 100%, strategy=spot, bin_step=100, vol=null",
+      "last_hit_session": null,
+      "created_at": "2026-03-30T08:30:00.698Z"
+    },
+    {
+      "hits": 11,
+      "key": "ANIME-SOL",
+      "value": "OOR-upside, PnL 0.6%, fees 0.0079 SOL, age 32m",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-30T09:18:16.536Z"
+    }
+  ]
+}

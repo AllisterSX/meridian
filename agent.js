@@ -5,7 +5,7 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "update_config", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "update_config", "get_wallet_balance", "get_my_positions"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "update_config", "get_wallet_balance", "get_my_positions", "recall_memory", "remember_fact", "get_price_analysis"]);
 
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
@@ -22,7 +22,7 @@ const INTENT_TOOLS = {
   screen:      new Set(["get_top_candidates", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "check_smart_wallets_on_pool", "get_pool_detail", "get_my_positions", "discover_pools"]),
   memory:      new Set(["get_pool_memory", "add_pool_note", "list_blacklist", "add_to_blacklist", "remove_from_blacklist"]),
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
-  study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools"]),
+  study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
   performance: new Set(["get_performance_history", "get_my_positions", "get_position_pnl"]),
   lessons:     new Set(["add_lesson", "pin_lesson", "unpin_lesson", "list_lessons", "clear_lessons"]),
 };
@@ -40,8 +40,8 @@ const INTENT_PATTERNS = [
   { intent: "strategy",    re: /\b(strategy|strategies)\b/i },
   { intent: "screen",      re: /\b(screen|candidate|find pool|search|research|token)\b/i },
   { intent: "memory",      re: /\b(memory|pool history|note|remember)\b/i },
-  { intent: "smartwallet", re: /\b(smart wallet|kol|whale|watch.?list|add wallet|remove wallet|list wallet|tracked wallet|analyze pool|check pool|who.?s in|wallets in|add to (smart|watch|kol))\b/i },
-  { intent: "study",       re: /\b(study top|top lper|best lper|who.?s lping|lp behavior|lper)\b/i },
+  { intent: "smartwallet", re: /\b(smart wallet|kol|whale|watch.?list|add wallet|remove wallet|list wallet|tracked wallet|check pool|who.?s in|wallets in|add to (smart|watch|kol))\b/i },
+  { intent: "study",       re: /\b(study top|top lpers?|best lpers?|who.?s lping|lp behavior|lpers?)\b/i },
   { intent: "performance", re: /\b(performance|history|how.?s the bot|how.?s it doing|stats|report)\b/i },
   { intent: "lessons",     re: /\b(lesson|learned|teach|pin|unpin|clear lesson|what did you learn)\b/i },
 ];
@@ -77,7 +77,25 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "openai/gpt-oss-120b";
+
+const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
+const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|sol|how much|show positions|open positions|my positions|position pnl|list positions|portfolio|pnl|yield|range|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
+const CONFIG_READ_ONLY_INTENTS = /\b(check|show|what(?:'s| is)?|review|inspect|see)\b.*\b(config|settings?|thresholds?)\b/i;
+
+function shouldRequireRealToolUse(goal, agentType, interactive = false) {
+  // MANAGER: runs against pre-fetched data, never needs forced tool use
+  if (agentType === "MANAGER") return false;
+  // SCREENER: candidates are pre-loaded in the goal by index.js — the model is
+  // allowed to return "no suitable candidates" as a valid text final answer.
+  // Forcing tool use here causes the rejection loop when the model legitimately
+  // decides not to deploy (e.g. all candidates filtered by ATH/bundle/organic).
+  // Hallucination protection for SCREENER is handled separately below.
+  if (agentType === "SCREENER") return false;
+  if (CONFIG_READ_ONLY_INTENTS.test(goal)) return false;
+  if (MUTATING_TOOL_INTENTS.test(goal)) return true;
+  return interactive && LIVE_DATA_TOOL_INTENTS.test(goal);
+}
 
 /**
  * Core ReAct agent loop.
@@ -86,13 +104,27 @@ const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
  * @param {number} maxSteps - Safety limit on iterations (default 20)
  * @returns {string} - The agent's final text response
  */
-export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null) {
+export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
+  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary);
+  let weightsSummary = null;
+  let lpOverviewSummary = null;
+  if (agentType === "SCREENER") {
+    try {
+      const { getWeightsSummary } = await import("./signal-weights.js");
+      const { config } = await import("./config.js");
+      if (config.darwin?.enabled) weightsSummary = getWeightsSummary();
+    } catch { /* signal-weights not critical */ }
+    try {
+      const { getLpOverviewSummary } = await import("./tools/lp-overview.js");
+      lpOverviewSummary = await getLpOverviewSummary();
+    } catch { /* lp-overview not critical — requires LPAGENT_API_KEY */ }
+  }
+  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, weightsSummary, lpOverviewSummary);
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -106,6 +138,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
+  const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
+  let sawToolCall = false;
+  let noToolRetryCount = 0;
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -118,9 +153,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
       let response;
       let usedModel = activeModel;
-      // Force a tool call on step 0 for action intents — prevents model from hallucinating results
+      // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      const toolChoice = (step === 0 && agentType === "GENERAL" && ACTION_INTENTS.test(goal)) ? "required" : "auto";
+      const toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         response = await client.chat.completions.create({
@@ -175,16 +210,75 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        // Hermes sometimes returns null content — pop the empty message and retry once
+        // Empty content — pop and retry once
         if (!msg.content) {
-          messages.pop(); // remove the empty assistant message
+          messages.pop();
           log("agent", "Empty response, retrying...");
           continue;
         }
+
+        // ── SCREENER hallucination guard ──────────────────────────────────
+        // Only fires when model gives a final answer WITHOUT ever calling any
+        // tool at all (sawToolCall=false). This catches cases where the model
+        // hallucinates a "Deployed into X" message without actually calling
+        // deploy_position. Does NOT fire for legitimate "no suitable candidates"
+        // decisions — those are valid text responses and allowed through.
+        if (agentType === "SCREENER" && !sawToolCall) {
+          const looksLikeHallucination = /deployed|i (?:have |just )?deployed|position (?:opened|created)|successfully (?:opened|deployed)|🚀\s*DEPLOYED|DEPLOYED\s*\n|◎.*SOL.*bid_ask|Range:.*→/i.test(msg.content);
+          if (looksLikeHallucination) {
+            messages.pop();
+            log("agent", "SCREENER hallucination detected — claimed deploy without tool call. Forcing retry.");
+            messages.push({
+              role: "user",
+              content: "You claimed to deploy a position but never called deploy_position. You MUST call deploy_position to actually open a position. Call it now with the correct arguments, or explicitly state that no candidates pass your criteria.",
+            });
+            continue;
+          }
+          // Legitimate no-deploy decision — pass through
+          log("agent", "SCREENER: no tool call — legitimate no-deploy decision");
+        }
+
+        // ── GENERAL / interactive mustUseRealTool guard ───────────────────
+        if (mustUseRealTool && !sawToolCall) {
+          noToolRetryCount += 1;
+          messages.pop();
+          log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);
+          if (noToolRetryCount >= 2) {
+            return {
+              content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
+              userMessage: goal,
+              didDeploy: false,
+              didClose: false,
+            };
+          }
+          messages.push({
+            role: "system",
+            content: "You have not used any tool yet. This request requires real tool execution or live tool-backed data. Do not answer from memory or inference. Call the appropriate tool first, then report only the real result.",
+          });
+          continue;
+        }
+
+        // ── Compute didDeploy / didClose from message history ─────────────
+        // Only count as didDeploy if deploy_position actually succeeded (success=true).
+        // If the tool was called but failed (e.g. simulation error), didDeploy stays false
+        // so the hallucination check in index.js doesn't fire a false warning.
+        const didDeploy = messages.some(m => {
+          if (m.role !== "tool" || !m.content) return false;
+          try {
+            const r = JSON.parse(m.content);
+            return r.success === true && r.position && r.pool;
+          } catch { return false; }
+        });
+        const toolCallNames = messages
+          .filter(m => m.role === "assistant" && m.tool_calls)
+          .flatMap(m => m.tool_calls.map(tc => tc.function?.name));
+        const didClose  = toolCallNames.includes("close_position");
+
         log("agent", "Final answer reached");
         log("agent", msg.content);
-        return { content: msg.content, userMessage: goal };
+        return { content: msg.content, userMessage: goal, didDeploy, didClose, messages };
       }
+      sawToolCall = true;
 
       // Execute each tool call in parallel
       const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
@@ -206,13 +300,29 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         // Block once-per-session tools from firing a second time
         if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
           log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
+          await onToolFinish?.({
+            name: functionName,
+            args: functionArgs,
+            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
+            success: false,
+            step,
+          });
           return {
             role: "tool",
             tool_call_id: toolCall.id,
             content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
           };
         }
+
+        await onToolStart?.({ name: functionName, args: functionArgs, step });
         const result = await executeTool(functionName, functionArgs);
+        await onToolFinish?.({
+          name: functionName,
+          args: functionArgs,
+          result,
+          success: result?.success !== false && !result?.error && !result?.blocked,
+          step,
+        });
 
         // Lock deploy_position after first attempt regardless of outcome — retrying is never right
         // For close/swap: only lock on success so genuine failures can be retried
@@ -243,7 +353,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   }
 
   log("agent", "Max steps reached without final answer");
-  return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal };
+  return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal, didDeploy: false, didClose: false, messages };
 }
 
 function sleep(ms) {

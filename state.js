@@ -13,6 +13,19 @@ import { log } from "./logger.js";
 
 const STATE_FILE = "./state.json";
 
+
+const MAX_INSTRUCTION_LENGTH = 280;
+
+function sanitizeStoredText(text, maxLen = MAX_INSTRUCTION_LENGTH) {
+  if (text == null) return null;
+  const cleaned = String(text)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[<>`]/g, "")
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || null;
+}
 const MAX_RECENT_EVENTS = 20;
 
 function load() {
@@ -55,6 +68,7 @@ export function trackPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  signal_snapshot = null,
 }) {
   const state = load();
   state.positions[position] = {
@@ -72,6 +86,7 @@ export function trackPosition({
     initial_fee_tvl_24h: fee_tvl_ratio,
     organic_score,
     initial_value_usd,
+    signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
     last_claim_at: null,
@@ -81,11 +96,13 @@ export function trackPosition({
     closed_at: null,
     notes: [],
     peak_pnl_pct: 0,
+    pending_peak_pnl_pct: null,        
+    pending_peak_started_at: null,      
     trailing_active: false,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
-  log("state", `Tracked new position: ${position} in pool ${pool}`);
+  log("state", `Tracked new position: ${position} in pool ${pool_name || pool}`);
 }
 
 /**
@@ -98,12 +115,12 @@ export function markOutOfRange(position_address) {
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
     save(state);
-    log("state", `Position ${position_address} marked out of range`);
+    log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} marked out of range`);
   }
 }
 
 /**
- * Mark a position as back in range (clears OOR timestamp).
+ * Mark a position as out of range (sets timestamp on first detection).
  */
 export function markInRange(position_address) {
   const state = load();
@@ -112,7 +129,7 @@ export function markInRange(position_address) {
   if (pos.out_of_range_since) {
     pos.out_of_range_since = null;
     save(state);
-    log("state", `Position ${position_address} back in range`);
+    log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} back in range`);
   }
 }
 
@@ -164,7 +181,7 @@ export function recordClose(position_address, reason) {
   pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
   pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
   save(state);
-  log("state", `Position ${position_address} marked closed: ${reason}`);
+  log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} marked closed: ${reason}`);
 }
 
 /**
@@ -194,14 +211,80 @@ export function setPositionInstruction(position_address, instruction) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return false;
-  pos.instruction = instruction || null;
+  pos.instruction = sanitizeStoredText(instruction);
+  save(state);                                                              
+  log("state", `Position ${position_address} instruction set: ${pos.instruction}`); 
+  return true;                                                            
+}                                                                          
+
+export function queuePeakConfirmation(position_address, candidatePnlPct) {
+  if (candidatePnlPct == null) return false;
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+
+  const currentPeak = pos.peak_pnl_pct ?? 0;
+
+  // --- 🛡️ ANTI-GLITCH FILTER (TAHAP ANTRIAN) ---
+  // Jika PnL melompat tidak masuk akal (> 10% dari peak saat ini) secara instan, abaikan.
+  if (candidatePnlPct > currentPeak + 10) {
+    log("state_warn", `Position ${position_address}: Ignored absurd PnL spike ${candidatePnlPct.toFixed(2)}% (current peak: ${currentPeak.toFixed(2)}%)`);
+    return false;
+  }
+
+  if (candidatePnlPct <= currentPeak) return false;
+
+  const changed =
+    pos.pending_peak_pnl_pct == null ||
+    candidatePnlPct > pos.pending_peak_pnl_pct;
+
+  if (!changed) return false;
+
+  pos.pending_peak_pnl_pct = candidatePnlPct;
+  pos.pending_peak_started_at = new Date().toISOString();
   save(state);
-  log("state", `Position ${position_address} instruction set: ${instruction}`);
+  log("state", `Position ${position_address} peak candidate ${candidatePnlPct.toFixed(2)}% queued for 15s confirmation`);
   return true;
+}
+
+export function resolvePendingPeak(position_address, currentPnlPct, toleranceRatio = 0.85) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed || pos.pending_peak_pnl_pct == null) return { confirmed: false, pending: false };
+
+  const pendingPeak = pos.pending_peak_pnl_pct;
+  pos.pending_peak_pnl_pct = null;
+  pos.pending_peak_started_at = null;
+  const currentPeak = pos.peak_pnl_pct ?? 0;
+
+  // --- 🛡️ ANTI-GLITCH FILTER (TAHAP KONFIRMASI) ---
+  let safeCurrentPnl = currentPnlPct;
+  if (currentPnlPct != null && currentPnlPct > currentPeak + 10) {
+    log("state_warn", `Position ${position_address}: Ignored absurd PnL spike during recheck ${currentPnlPct.toFixed(2)}%`);
+    safeCurrentPnl = pendingPeak; // Kembalikan ke angka pending yang lebih rasional
+  }
+
+  if (safeCurrentPnl != null && safeCurrentPnl >= pendingPeak * toleranceRatio) {
+    // BUG FIX: peak dikonfirmasi HANYA dari nilai yang di-queue (pendingPeak),
+    // bukan dari currentPnlPct saat recheck. currentPnlPct hanya digunakan
+    // sebagai validasi bahwa harga masih "dekat" dengan pendingPeak (toleranceRatio).
+    // Mempromosikan currentPnlPct yang lebih tinggi sebagai peak baru menyebabkan
+    // trailing TP trigger prematur karena peak di-set berdasarkan snapshot 15s
+    // yang bisa langsung drop, bukan peak yang telah stabil selama interval penuh.
+    pos.peak_pnl_pct = Math.max(currentPeak, pendingPeak);
+    save(state);
+    log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck`);
+    return { confirmed: true, peak: pos.peak_pnl_pct };
+  }
+
+  save(state);
+  log("state", `Position ${position_address} rejected pending peak ${pendingPeak.toFixed(2)}% after 15s recheck (current: ${safeCurrentPnl ?? "?"}%)`);
+  return { confirmed: false, rejected: true, pendingPeak };
 }
 
 /**
  * Get all tracked positions (optionally filter open-only).
+ * @internal Used by external tools (briefing.js, knowledge-graph.js) — not imported by audited files.
  */
 export function getTrackedPositions(openOnly = false) {
   const state = load();
@@ -264,28 +347,22 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
-  // Track peak PnL
-  if (currentPnlPct != null && currentPnlPct > (pos.peak_pnl_pct ?? 0)) {
-    pos.peak_pnl_pct = currentPnlPct;
-    changed = true;
-  }
-
   // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && currentPnlPct >= mgmtConfig.trailingTriggerPct) {
+  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
     pos.trailing_active = true;
     changed = true;
-    log("state", `Position ${position_address} trailing TP activated at ${currentPnlPct}% (peak: ${pos.peak_pnl_pct}%)`);
+    log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} trailing TP activated (confirmed peak: ${pos.peak_pnl_pct}%)`);
   }
 
   // Update OOR state
   if (in_range === false && !pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
     changed = true;
-    log("state", `Position ${position_address} marked out of range`);
+    log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} marked out of range`);
   } else if (in_range === true && pos.out_of_range_since) {
     pos.out_of_range_since = null;
     changed = true;
-    log("state", `Position ${position_address} back in range`);
+    log("state", `Position ${pos.pool_name || position_address.slice(0, 8)} back in range`);
   }
 
   if (changed) save(state);
@@ -375,7 +452,7 @@ export function syncOpenPositions(active_addresses) {
     // Grace period: newly deployed positions may not be indexed yet
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
     if (Date.now() - deployedAt < SYNC_GRACE_MS) {
-      log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+      log("state", `Position ${pos.pool_name || posId.slice(0, 8)} not on-chain yet — within grace period, skipping auto-close`);
       continue;
     }
 
@@ -383,7 +460,7 @@ export function syncOpenPositions(active_addresses) {
     pos.closed_at = new Date().toISOString();
     pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
     changed = true;
-    log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
+    log("state", `Position ${pos.pool_name || posId.slice(0, 8)} auto-closed (missing from on-chain data)`);
   }
 
   if (changed) save(state);

@@ -1,0 +1,53 @@
+{
+  "facts": [
+    {
+      "hits": 320,
+      "key": "bid_ask_bs125",
+      "value": "ANIME-SOL OOR-upside, PnL 0.6%, age 32m",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-29T09:20:00.286Z"
+    },
+    {
+      "hits": 0,
+      "key": "bidaskbs125",
+      "value": "profitable, PnL 0.0%, vol=13.37, fee_tvl=5.6809",
+      "last_hit_session": null,
+      "created_at": "2026-03-29T12:25:55.519Z"
+    },
+    {
+      "hits": 230,
+      "key": "bid_ask_bs100",
+      "value": "PERK-SOL OOR-upside, PnL 0.0%, age 6m",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-29T15:10:00.273Z"
+    },
+    {
+      "hits": 0,
+      "key": "bidaskbs100",
+      "value": "profitable, PnL 0.8%, vol=null, fee_tvl=null",
+      "last_hit_session": null,
+      "created_at": "2026-03-29T15:22:41.154Z"
+    },
+    {
+      "hits": 0,
+      "key": "spotbs100",
+      "value": "unprofitable, PnL -20.2%, vol=null, fee_tvl=null",
+      "last_hit_session": null,
+      "created_at": "2026-03-30T08:36:37.064Z"
+    },
+    {
+      "hits": 3,
+      "key": "bid_ask_bs80",
+      "value": "ANIME-SOL OOR-upside, PnL 0.1%, age 19m",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-30T10:45:00.172Z"
+    },
+    {
+      "key": "bidaskbs80",
+      "value": "profitable, PnL 0.1%, vol=3.19, fee_tvl=1.1677",
+      "hits": 0,
+      "last_hit_session": null,
+      "created_at": "2026-03-30T11:01:00.338Z"
+    }
+  ]
+}

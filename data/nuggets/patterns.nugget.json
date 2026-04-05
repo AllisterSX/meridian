@@ -1,0 +1,32 @@
+{
+  "facts": [
+    {
+      "hits": 63,
+      "key": "volatility_4",
+      "value": "ANIME-SOL OOR-upside at vol=3.57, PnL 0.6%",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-29T09:20:00.285Z"
+    },
+    {
+      "hits": 5,
+      "key": "volatility_7",
+      "value": "PERK-SOL OOR-upside at vol=6.85, PnL 0.0%",
+      "last_hit_session": "session_1774797575629",
+      "created_at": "2026-03-29T15:10:00.273Z"
+    },
+    {
+      "hits": 82,
+      "key": "volatility_2",
+      "value": "Clippy-SOL in-range at vol=1.64, PnL 0.3%",
+      "last_hit_session": "session_1774859014445",
+      "created_at": "2026-03-29T18:30:00.070Z"
+    },
+    {
+      "hits": 17,
+      "key": "volatility_3",
+      "value": "ANIME-SOL OOR-upside at vol=3.19, PnL 0.1%",
+      "last_hit_session": "session_1774867888709",
+      "created_at": "2026-03-29T23:25:00.900Z"
+    }
+  ]
+}
