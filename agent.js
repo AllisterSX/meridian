@@ -439,9 +439,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+        // Lock deploy_position after first attempt regardless of outcome — retrying is never right.
+        // Exception: safety-blocked preflight checks (result.blocked=true) do not touch chain state,
+        // so the model may try the next candidate with a corrected pool_address.
+        if (NO_RETRY_TOOLS.has(functionName)) {
+          if (!result?.blocked) firedOnce.add(functionName);
+        }
         else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
 
         return {

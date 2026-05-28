@@ -990,6 +990,7 @@ STEPS:
 2. Pick the best candidate only if it has real conviction from narrative quality, smart wallets, and pool metrics. If the list has only one pool and it lacks narrative or smart-wallet confirmation, skip the cycle.
    Pool memory OOR context: OOR with positive realized PnL is not a pool skip reason by itself; treat it as a profitable momentum exit unless current metrics are weak.
 3. If a pool qualifies, call deploy_position. The deploy tool performs fresh Pool Discovery safety checks before any transaction; ${config.screening.timeframe} volume is already screened before candidates reach you.
+   CRITICAL: pool_address must be the on-chain address from the POOL line (the hex string in parentheses), NOT the pool name or symbol. Example: POOL: 250-SOL (AbCd1234...) → pool_address = "AbCd1234..."
    strategy = ${config.strategy.strategy} (always use this, never change it).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
