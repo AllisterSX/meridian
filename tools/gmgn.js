@@ -154,23 +154,27 @@ function rankVolume(token) {
 }
 
 export async function fetchFreshGmgnRankVolume(mint, { interval = config.gmgn?.interval } = {}) {
+  // Fetch fresh token info — single request, works for ANY token (not just top 100 by rank).
+  // /v1/market/rank only returns ranked tokens; small tokens won't be found there.
+  const info = await getGmgnTokenInfo(mint).catch(() => null);
+  if (!info) return null;
+
   const normalizedInterval = normalizeInterval(interval, "5m");
-  const rankPayload = await gmgnFetch("/v1/market/rank", {
-    params: {
-      chain: "sol",
-      interval: normalizedInterval,
-      order_by: config.gmgn?.orderBy || "volume",
-      direction: config.gmgn?.direction || "desc",
-      limit: Math.min(100, Math.max(1, Number(config.gmgn?.limit || 100))),
-      filters: config.gmgn?.filters || [],
-      platforms: config.gmgn?.platforms || [],
-    },
-  });
-  const ranked = unwrapList(rankPayload, ["rank", "list", "data"]);
-  const target = String(mint || "").trim();
-  const token = ranked.find((entry) => String(entry?.address || "").trim() === target);
-  if (!token) return null;
-  return rankVolume(token);
+  // Volume fields are nested under `price` block: volume_1m, volume_5m, volume_1h, volume_6h, volume_24h
+  const volumeKey = `volume_${normalizedInterval}`;
+  const priceBlock = info?.price || {};
+  const candidates = [
+    priceBlock[volumeKey],
+    priceBlock.volume_5m,
+    priceBlock.volume_1h,
+    info[volumeKey],
+    info.volume,
+  ];
+  for (const value of candidates) {
+    const n = optionalNum(value);
+    if (n != null) return n;
+  }
+  return null;
 }
 
 function hasTag(entry, tag) {
