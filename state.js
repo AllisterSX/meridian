@@ -42,9 +42,32 @@ function load() {
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
+    pruneClosedPositions(state);
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
+  }
+}
+
+// Kept small: closed positions don't need to be in the prompt (lessons.json + pool-memory.json
+// already capture the learning). Only needed for audit/reconciliation lookups.
+const MAX_CLOSED_POSITIONS = 10;
+
+/**
+ * Keep only the most recent MAX_CLOSED_POSITIONS closed entries.
+ * Open positions are never touched. Called automatically before every save.
+ * This prevents state.json from growing unbounded on 24/7 bots with many daily closes.
+ */
+function pruneClosedPositions(state) {
+  const closed = Object.entries(state.positions)
+    .filter(([, p]) => p.closed)
+    .sort(([, a], [, b]) => (a.closed_at || "").localeCompare(b.closed_at || ""));
+
+  const excess = closed.length - MAX_CLOSED_POSITIONS;
+  if (excess > 0) {
+    for (let i = 0; i < excess; i++) {
+      delete state.positions[closed[i][0]];
+    }
   }
 }
 
@@ -65,6 +88,7 @@ export function trackPosition({
   bin_step,
   volatility,
   fee_tvl_ratio,
+  volume_window,
   organic_score,
   initial_value_usd,
   signal_snapshot = null,
@@ -82,6 +106,7 @@ export function trackPosition({
     bin_step,
     volatility,
     fee_tvl_ratio,
+    volume_window,
     initial_fee_tvl_24h: fee_tvl_ratio,
     organic_score,
     initial_value_usd,
@@ -108,6 +133,52 @@ export function trackPosition({
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
   log("state", `Tracked new position: ${position} in pool ${pool}`);
+}
+
+function finiteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function getLowYieldExtension(positionRecord, positionData = {}, mgmtConfig = {}) {
+  const extraMinutes = finiteNumber(mgmtConfig.lowYieldGoodStableExtraMinutes ?? 30);
+  if (!positionRecord || !extraMinutes || extraMinutes <= 0) {
+    return { extend: false, extraMinutes: 0 };
+  }
+
+  const age = finiteNumber(positionData.age_minutes);
+  const baseAge = finiteNumber(mgmtConfig.minAgeBeforeYieldCheck ?? 30) ?? 30;
+  if (age == null || age < baseAge || age >= baseAge + extraMinutes) {
+    return { extend: false, extraMinutes };
+  }
+
+  const snapshot = positionRecord.signal_snapshot || {};
+  const organic = finiteNumber(positionRecord.organic_score ?? snapshot.organic_score);
+  const volatility = finiteNumber(positionRecord.volatility ?? snapshot.volatility);
+  const entryFeeTvl = finiteNumber(positionRecord.fee_tvl_ratio ?? snapshot.fee_tvl_ratio);
+  const volume = finiteNumber(positionRecord.volume_window ?? snapshot.volume);
+  const pnl = finiteNumber(positionData.pnl_pct);
+  const minOrganic = finiteNumber(mgmtConfig.lowYieldGoodStableMinOrganic ?? 80) ?? 80;
+  const maxVolatility = finiteNumber(mgmtConfig.lowYieldStableMaxVolatility ?? 4) ?? 4;
+  const minEntryFeeTvl = finiteNumber(mgmtConfig.lowYieldGoodStableMinEntryFeeTvl ?? 0.05) ?? 0.05;
+  const minVolume = finiteNumber(mgmtConfig.lowYieldGoodStableMinVolume ?? 500) ?? 500;
+  const minPnl = finiteNumber(mgmtConfig.lowYieldStableMinPnlPct ?? -1) ?? -1;
+
+  const goodScore =
+    organic != null && organic >= minOrganic &&
+    entryFeeTvl != null && entryFeeTvl >= minEntryFeeTvl &&
+    (volume == null || volume >= minVolume);
+  const stableCoin =
+    positionData.in_range === true &&
+    volatility != null && volatility <= maxVolatility &&
+    (pnl == null || pnl >= minPnl);
+
+  return {
+    extend: goodScore && stableCoin,
+    extraMinutes,
+    untilAgeMinutes: baseAge + extraMinutes,
+    reason: `good/stable low-yield grace: organic=${organic ?? "?"}, volatility=${volatility ?? "?"}, entry fee/TVL=${entryFeeTvl ?? "?"}, volume=${volume ?? "?"}, pnl=${pnl ?? "?"}`,
+  };
 }
 
 /**
@@ -471,6 +542,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
     (age_minutes == null || age_minutes >= minAgeForYieldCheck)
   ) {
+    const extension = getLowYieldExtension(pos, positionData, mgmtConfig);
+    if (extension.extend) {
+      log("state", `Holding ${position_address} through low yield until ${extension.untilAgeMinutes}m (${extension.reason})`);
+      return null;
+    }
     return {
       action: "LOW_YIELD",
       reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${age_minutes ?? "?"}m)`,

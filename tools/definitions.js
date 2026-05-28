@@ -1012,6 +1012,30 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
   {
     type: "function",
     function: {
+      name: "compact_memory",
+      description: `Prune stale data to stay within token budget.
+- Removes lessons older than max_lesson_age_days (pinned lessons are always kept)
+- Trims performance records to the most recent max_perf_records
+- Removes pool memory entries with no deploys and no active cooldowns older than stale_days
+- Trims oversized deploy history, notes, and snapshot arrays per pool
+
+Run this periodically if lessons.json or pool-memory.json grows too large.`,
+      parameters: {
+        type: "object",
+        properties: {
+          max_lesson_age_days: { type: "number", description: "Max age in days for unpinned lessons. Default 7." },
+          max_perf_records: { type: "number", description: "Max performance records to keep. Default 150." },
+          max_deploys_per_pool: { type: "number", description: "Max deploy records to keep per pool. Default 10." },
+          stale_days: { type: "number", description: "Remove pool entries with no activity for this many days. Default 1." }
+        },
+        required: []
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "get_pool_memory",
       description: `Check your deploy history for a pool BEFORE deploying.
 Returns all past deploys, PnL, win rate, and any notes you've added.

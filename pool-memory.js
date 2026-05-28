@@ -465,3 +465,83 @@ export function purgeStaleSnapshots() {
 
   return { pools_checked: poolsChecked, snapshots_cleared: snapshotsCleared };
 }
+
+/**
+ * Compact pool-memory.json — remove stale pools and trim oversized arrays.
+ * Called by the daily compaction cron and the compact_memory tool.
+ *
+ * @param {Object} opts
+ * @param {number} opts.maxDeploysPerPool - Max deploy records per pool (default 10)
+ * @param {number} opts.maxNotesPerPool   - Max notes per pool (default 3)
+ * @param {number} opts.snapshotCap       - Max snapshots per pool (default 12)
+ * @param {number} opts.staleDays         - Remove pools with no activity for this many days (default 1)
+ * @returns {{ pools_before, pools_after, pools_pruned, deploys_trimmed }}
+ */
+export function compactPoolMemory({
+  maxDeploysPerPool = 10,
+  maxNotesPerPool   = 3,
+  snapshotCap       = 12,
+  staleDays         = 1,
+} = {}) {
+  const db = load();
+  const now = new Date();
+  const staleMs = staleDays * 24 * 60 * 60 * 1000;
+
+  const report = {
+    pools_before:    Object.keys(db).length,
+    pools_after:     0,
+    pools_pruned:    0,
+    deploys_trimmed: 0,
+  };
+
+  for (const [poolAddress, entry] of Object.entries(db)) {
+    // ── Stale pool removal ─────────────────────────────────────────────────
+    const lastDeployDate = entry.last_deployed_at ? new Date(entry.last_deployed_at) : null;
+    const isStale = !lastDeployDate || (now - lastDeployDate) > staleMs;
+    const hasActiveCooldown =
+      (entry.cooldown_until && new Date(entry.cooldown_until) > now) ||
+      (entry.base_mint_cooldown_until && new Date(entry.base_mint_cooldown_until) > now);
+
+    if (isStale && !hasActiveCooldown) {
+      delete db[poolAddress];
+      report.pools_pruned++;
+      continue;
+    }
+
+    // ── Deploy records: recompute aggregates from full history, then trim ──
+    const deploys = entry.deploys || [];
+    if (deploys.length > maxDeploysPerPool) {
+      const allWithPnl = deploys.filter(d => d.pnl_pct != null);
+      if (allWithPnl.length > 0) {
+        entry.avg_pnl_pct = Math.round(
+          (allWithPnl.reduce((s, d) => s + d.pnl_pct, 0) / allWithPnl.length) * 100
+        ) / 100;
+        entry.win_rate = Math.round(
+          (allWithPnl.filter(d => d.pnl_pct >= 0).length / allWithPnl.length) * 100
+        ) / 100;
+      }
+      entry.total_deploys = deploys.length;
+      const before = deploys.length;
+      entry.deploys = deploys.slice(-maxDeploysPerPool);
+      report.deploys_trimmed += before - entry.deploys.length;
+    }
+
+    // ── Notes: always keep DLMM-tagged notes, then recent others ──
+    if ((entry.notes?.length ?? 0) > maxNotesPerPool) {
+      const dlmmNotes  = (entry.notes || []).filter(n => n.tag === "dlmm_supply");
+      const otherNotes = (entry.notes || []).filter(n => n.tag !== "dlmm_supply");
+      const keepOthers = otherNotes.slice(-Math.max(1, maxNotesPerPool - dlmmNotes.length));
+      entry.notes = [...dlmmNotes, ...keepOthers];
+    }
+
+    // ── Snapshots: trim to snapshotCap ──
+    if ((entry.snapshots?.length ?? 0) > snapshotCap) {
+      entry.snapshots = entry.snapshots.slice(-snapshotCap);
+    }
+  }
+
+  report.pools_after = Object.keys(db).length;
+  save(db);
+  log("pool-memory", `Compaction: ${report.pools_before} → ${report.pools_after} pools (${report.pools_pruned} removed, ${report.deploys_trimmed} deploy records trimmed)`);
+  return report;
+}

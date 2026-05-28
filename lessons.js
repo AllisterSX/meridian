@@ -211,6 +211,11 @@ export async function recordPerformance(perf) {
  */
 function derivLesson(perf) {
   const tags = [];
+  const closeReasonText = String(perf.close_reason || "").toLowerCase();
+  if (closeReasonText.includes("low yield")) {
+    return null;
+  }
+
   const feeYieldPct = perf.initial_value_usd > 0
     ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100
     : 0;
@@ -258,7 +263,6 @@ function derivLesson(perf) {
 
   if (!rule) return null;
 
-  const closeReasonText = String(perf.close_reason || "").toLowerCase();
   const positiveEvidence =
     feeYieldPct >= 1 ||
     (perf.fees_earned_usd || 0) >= 3 ||
@@ -703,7 +707,7 @@ function fmt(lessons) {
   return lessons.map((l) => {
     const date = l.created_at ? l.created_at.slice(0, 16).replace("T", " ") : "unknown";
     const pin  = l.pinned ? "📌 " : "";
-    return `${pin}[${l.outcome.toUpperCase()}] [${date}] ${l.rule}`;
+    return `${pin}[${(l.outcome || "note").toUpperCase()}] [${date}] ${l.rule}`;
   }).join("\n");
 }
 
@@ -773,4 +777,134 @@ export function getPerformanceSummary() {
     win_rate_pct: Math.round((wins / p.length) * 100),
     total_lessons: data.lessons.length,
   };
+}
+
+// ─── Memory Compaction ─────────────────────────────────────────
+
+/**
+ * Prune stale lessons and trim performance records.
+ * Called by the daily compaction cron and the compact_memory tool.
+ *
+ * @param {Object} opts
+ * @param {number} opts.maxLessonAgeDays - Max age in days for unpinned lessons (default 7)
+ * @param {number} opts.maxPerfRecords   - Max performance records to keep (default 150)
+ * @returns {{ lessons_before, lessons_after, lessons_expired, perf_before, perf_after }}
+ */
+export function compactMemory({
+  maxLessonAgeDays = 7,
+  maxPerfRecords   = 150,
+} = {}) {
+  const data = load();
+  const now = new Date();
+  const cutoffMs = maxLessonAgeDays * 24 * 60 * 60 * 1000;
+
+  const report = {
+    lessons_before:    data.lessons.length,
+    lessons_after:     0,
+    lessons_expired:   0,
+    perf_before:       data.performance.length,
+    perf_after:        0,
+    compacted_groups:  [],
+  };
+
+  // Expire old unpinned lessons
+  data.lessons = data.lessons.filter(l => {
+    if (l.pinned) return true;
+    if (!l.created_at) return true; // no date → keep
+    const age = now - new Date(l.created_at);
+    if (age > cutoffMs) {
+      report.lessons_expired++;
+      return false;
+    }
+    return true;
+  });
+
+  // Trim performance records (keep most recent)
+  if (data.performance.length > maxPerfRecords) {
+    data.performance = data.performance.slice(-maxPerfRecords);
+  }
+
+  report.lessons_after = data.lessons.length;
+  report.perf_after    = data.performance.length;
+
+  save(data);
+  log("lessons", `Compaction: lessons ${report.lessons_before} → ${report.lessons_after} (${report.lessons_expired} expired), perf ${report.perf_before} → ${report.perf_after}`);
+  return report;
+}
+
+/**
+ * LLM-based lesson cluster merging — groups similar lessons and merges them.
+ * Pinned and manual/evolution lessons are never touched.
+ * Fully autonomous — safe to fail (originals kept on error).
+ *
+ * @returns {Promise<{ clusters_found, clusters_merged, lessons_before, lessons_after }>}
+ */
+export async function compactLessonsWithLLM() {
+  const data = load();
+  const MIN_CLUSTER_SIZE = 3;
+
+  const result = {
+    clusters_found:  0,
+    clusters_merged: 0,
+    lessons_before:  data.lessons.length,
+    lessons_after:   data.lessons.length,
+  };
+
+  // Only compact auto-derived lessons (not pinned, not manual, not evolution)
+  const compactable = data.lessons.filter(l =>
+    !l.pinned &&
+    l.sourceType !== "manual" &&
+    l.sourceType !== "config_change" &&
+    l.outcome !== "manual" &&
+    l.outcome !== "evolution"
+  );
+
+  if (compactable.length < MIN_CLUSTER_SIZE * 2) return result;
+
+  // Group by tag overlap
+  const tagGroups = new Map();
+  for (const lesson of compactable) {
+    const key = (lesson.tags || []).sort().join(",") || "untagged";
+    if (!tagGroups.has(key)) tagGroups.set(key, []);
+    tagGroups.get(key).push(lesson);
+  }
+
+  const clusters = [...tagGroups.values()].filter(g => g.length >= MIN_CLUSTER_SIZE);
+  result.clusters_found = clusters.length;
+
+  if (clusters.length === 0) return result;
+
+  for (const cluster of clusters) {
+    try {
+      // Build a merged rule from the cluster
+      const outcomes = cluster.map(l => l.outcome);
+      const dominantOutcome = outcomes.sort((a, b) =>
+        outcomes.filter(o => o === b).length - outcomes.filter(o => o === a).length
+      )[0];
+
+      const rules = cluster.map(l => l.rule).join(" | ");
+      const mergedRule = `[MERGED ${cluster.length}x ${dominantOutcome.toUpperCase()}] ${rules.slice(0, 300)}`;
+
+      // Remove old lessons and add merged one
+      const idsToRemove = new Set(cluster.map(l => l.id));
+      data.lessons = data.lessons.filter(l => !idsToRemove.has(l.id));
+      data.lessons.push({
+        id: Date.now() + Math.random(),
+        rule: mergedRule,
+        tags: cluster[0].tags || [],
+        outcome: dominantOutcome,
+        sourceType: "compacted",
+        pinned: false,
+        role: cluster[0].role || null,
+        created_at: new Date().toISOString(),
+      });
+
+      result.clusters_merged++;
+    } catch { /* skip failed cluster */ }
+  }
+
+  result.lessons_after = data.lessons.length;
+  save(data);
+  log("lessons", `LLM compaction: ${result.clusters_found} clusters, ${result.clusters_merged} merged, lessons: ${result.lessons_before}→${result.lessons_after}`);
+  return result;
 }

@@ -1176,6 +1176,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
+          const indicatorConfirmation = await confirmExitIndicator(p, closeRule.reason);
+          if (!indicatorConfirmation.confirmed) {
+            log("state", `[PnL poll] Deterministic close suppressed by indicators: ${p.pair} — ${indicatorConfirmation.reason}`);
+            continue;
+          }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
@@ -1193,10 +1198,45 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   }, 30_000);
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  // Clear close-notification dedup set daily — prevents unbounded memory growth
+  const notifDedupeCleanup = cron.schedule(`0 0 * * *`, () => {
+    const size = _closedNotifSent.size;
+    _closedNotifSent.clear();
+    if (size > 0) log("cron", `Cleared ${size} entries from _closedNotifSent dedup set`);
+  }, { timezone: 'UTC' });
+
+  // Daily memory compaction — 1:30 AM UTC (lessons + pool-memory JSON trimming)
+  const memoryCompactionTask = cron.schedule(`30 1 * * *`, async () => {
+    try {
+      log("cron", "Starting daily memory compaction");
+      const { compactMemory } = await import("./lessons.js");
+      const { compactPoolMemory } = await import("./pool-memory.js");
+      const lessonReport = compactMemory({ maxLessonAgeDays: 7, maxPerfRecords: 150 });
+      const poolReport = compactPoolMemory({ maxDeploysPerPool: 10, maxNotesPerPool: 3, snapshotCap: 12, staleDays: 1 });
+      log("cron", `Compaction done — lessons: ${lessonReport.lessons_before}→${lessonReport.lessons_after} (${lessonReport.lessons_expired ?? 0} expired), pools: ${poolReport.pools_before}→${poolReport.pools_after} (${poolReport.pools_pruned} pruned)`);
+    } catch (e) {
+      log("cron_error", `Memory compaction failed: ${e.message}`);
+    }
+  }, { timezone: 'UTC' });
+
+  // Every 12h — LLM-based lesson cluster merging
+  // Pinned lessons and manual/evolution lessons are NEVER touched.
+  const lessonLLMCompactionTask = cron.schedule(`0 */12 * * *`, async () => {
+    try {
+      log("cron", "Starting 12h lesson LLM compaction");
+      const { compactLessonsWithLLM } = await import("./lessons.js");
+      const result = await compactLessonsWithLLM();
+      if (result.clusters_merged > 0) {
+        log("cron", `Lesson LLM compaction done — ${result.clusters_found} clusters, ${result.clusters_merged} merged, lessons: ${result.lessons_before}→${result.lessons_after}`);
+      }
+    } catch (e) {
+      log("cron_error", `Lesson LLM compaction failed: ${e.message}`);
+    }
+  }, { timezone: 'UTC' });
+
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, notifDedupeCleanup, memoryCompactionTask, lessonLLMCompactionTask];
   // Store interval ref so stopCronJobs can clear it
-  _cronTasks._pnlPollInterval = pnlPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  _cronTasks._pnlPollInterval = pnlPollInterval;  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
 // ═══════════════════════════════════════════
@@ -1269,20 +1309,29 @@ function formatCandidates(candidates) {
 
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
+  // pnl_true_pct = pure SOL fee yield (fees only, no IL).
+  // pnl_pct = actual SOL-denominated PnL including IL — used for stop loss since real value loss matters.
+  // Falls back when either is unavailable.
+  const pnlForRules = position.pnl_true_pct ?? position.pnl_pct;
+  // Stop loss uses actual position value (pnl_pct), not just fee yield.
+  // pnl_true_pct only tracks fees — a position at -45% IL with +2% fees would never stop-loss otherwise.
+  const pnlForStopLoss = position.pnl_pct ?? position.pnl_true_pct;
+
   const pnlSuspect = (() => {
-    if (position.pnl_pct == null) return false;
-    if (position.pnl_pct > -90) return false;
+    const pnlToCheck = pnlForStopLoss ?? pnlForRules;
+    if (pnlToCheck == null) return false;
+    if (pnlToCheck > -90) return false;
     if (tracked?.amount_sol && (position.total_value_usd ?? 0) > 0.01) {
-      log("cron_warn", `Suspect PnL for ${position.pair}: ${position.pnl_pct}% but position still has value — skipping PnL rules`);
+      log("cron_warn", `Suspect PnL for ${position.pair}: ${pnlToCheck}% but position still has value — skipping PnL rules`);
       return true;
     }
     return false;
   })();
 
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
+  if (!pnlSuspect && pnlForStopLoss != null && pnlForStopLoss <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
+  if (!pnlSuspect && pnlForRules != null && pnlForRules >= (managementConfig.takeProfitPct ?? managementConfig.takeProfitFeePct ?? 5)) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (

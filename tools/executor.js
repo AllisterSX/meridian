@@ -13,12 +13,10 @@ import {
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
-import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
-import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
+import { getPoolMemory, addPoolNote } from "../pool-memory.js";import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
+import { addToBlacklist, removeFromBlacklist, listBlacklist, isBlacklisted } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
@@ -328,7 +326,7 @@ const toolMap = {
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
   deploy_position: deployPosition,
-  get_my_positions: getMyPositions,
+  get_my_positions: (args) => getMyPositions({ ...(args || {}), force: true }),
   get_wallet_positions: getWalletPositions,
   search_pools: searchPools,
   get_token_info: getTokenInfo,
@@ -382,6 +380,25 @@ const toolMap = {
   get_strategy:        getStrategy,
   set_active_strategy: setActiveStrategy,
   remove_strategy:     removeStrategy,
+  compact_memory: async ({ max_lesson_age_days, max_perf_records, max_deploys_per_pool, stale_days } = {}) => {
+    const { compactMemory } = await import("../lessons.js");
+    const { compactPoolMemory } = await import("../pool-memory.js");
+    const lessonReport = compactMemory({
+      maxLessonAgeDays: max_lesson_age_days ?? 7,
+      maxPerfRecords:   max_perf_records   ?? 150,
+    });
+    const poolReport = compactPoolMemory({
+      maxDeploysPerPool: max_deploys_per_pool ?? 10,
+      maxNotesPerPool:   3,
+      snapshotCap:       12,
+      staleDays:         stale_days ?? 1,
+    });
+    return {
+      success: true,
+      lessons: { before: lessonReport.lessons_before, after: lessonReport.lessons_after, expired: lessonReport.lessons_expired },
+      pools:   { before: poolReport.pools_before, after: poolReport.pools_after, pruned: poolReport.pools_pruned, deploys_trimmed: poolReport.deploys_trimmed },
+    };
+  },
   get_pool_memory: getPoolMemory,
   add_pool_note: addPoolNote,
   add_to_blacklist: addToBlacklist,
@@ -417,6 +434,19 @@ const toolMap = {
     return { error: "invalid mode" };
   },
   update_config: ({ changes, reason = "" }) => {
+    // Parameters locked by user — agent cannot change these
+    const LOCKED_PARAMS = {
+      minMcap:      'minMcap is locked at $150k — do not change market cap filter',
+      maxMcap:      'maxMcap is locked at $10M — do not change market cap filter',
+      gasReserve:   'gasReserve is locked at 0.2 SOL — gas reserve cannot be reduced',
+    };
+    const lockedAttempts = Object.keys(changes).filter(k => LOCKED_PARAMS[k]);
+    if (lockedAttempts.length > 0) {
+      const reasons = lockedAttempts.map(k => LOCKED_PARAMS[k]).join('; ');
+      log("config", `update_config BLOCKED locked params: ${lockedAttempts.join(', ')} — ${reasons}`);
+      return { success: false, blocked: lockedAttempts, reason: `Cannot change locked parameters: ${reasons}` };
+    }
+
     // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
@@ -765,7 +795,10 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, solMode: config.management.solMode }).catch(() => {});
+        // skip_notify=true when called from management cycle — index.js onToolFinish sends the
+        // notification there (with dedup via _closedNotifSent). Without this guard, every
+        // management-cycle close fires two Telegram messages.
+        if (!args.skip_notify) notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? 0, solMode: config.management.solMode }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -929,6 +962,12 @@ async function runSafetyChecks(name, args) {
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
           };
         }
+        // Blacklist check — block manually-specified blacklisted tokens
+        try {
+          if (isBlacklisted(args.base_mint)) {
+            return { pass: false, reason: `Token ${args.base_mint} is blacklisted. Skipping deploy.` };
+          }
+        } catch { /* non-critical */ }
       }
 
       // Check amount limits
