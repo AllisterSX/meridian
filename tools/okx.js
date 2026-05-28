@@ -166,6 +166,9 @@ export async function getRiskFlags(tokenAddress, chainId = CHAIN_SOLANA) {
 export async function getAdvancedInfo(tokenAddress, chainIndex = CHAIN_SOLANA) {
   const serverPayload = await getServerOkxEnrichmentOrNull(tokenAddress, chainIndex);
   if (serverPayload?.advanced) return serverPayload.advanced;
+  // If server responded but advanced is null/missing, the upstream OKX API is rejecting requests
+  // (rate limit, region block, etc). Don't waste time hitting OKX direct — just return null.
+  if (serverPayload) return null;
 
   const path = `/api/v6/dex/market/token/advanced-info?chainIndex=${chainIndex}&tokenContractAddress=${tokenAddress}`;
   const data = await okxGet(path);
@@ -203,6 +206,7 @@ export async function getAdvancedInfo(tokenAddress, chainIndex = CHAIN_SOLANA) {
 export async function getClusterList(tokenAddress, chainIndex = CHAIN_SOLANA, limit = 5) {
   const serverPayload = await getServerOkxEnrichmentOrNull(tokenAddress, chainIndex);
   if (Array.isArray(serverPayload?.clusters)) return serverPayload.clusters.slice(0, limit);
+  if (serverPayload) return [];
 
   const path = `/api/v6/dex/market/token/cluster/list?chainIndex=${chainIndex}&tokenContractAddress=${tokenAddress}`;
   const data = await okxGet(path);
@@ -233,6 +237,7 @@ export async function getClusterList(tokenAddress, chainIndex = CHAIN_SOLANA, li
 export async function getPriceInfo(tokenAddress, chainIndex = CHAIN_SOLANA) {
   const serverPayload = await getServerOkxEnrichmentOrNull(tokenAddress, chainIndex);
   if (serverPayload?.price) return serverPayload.price;
+  if (serverPayload) return null;
 
   const data = await okxPost("/api/v6/dex/market/price-info", [
     { chainIndex, tokenContractAddress: tokenAddress },

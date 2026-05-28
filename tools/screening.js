@@ -662,10 +662,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         ]);
 
         const mintShort = p.base.mint.slice(0, 8);
-        if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
-        if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
-        if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
-        if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
+        // Only log when the request actually threw (network/auth error).
+        // Successful response with null payload = OKX has no data for this token (common for small/new tokens) — no need to log.
+        if (adv.status === "rejected")      log("okx", `advanced-info error for ${p.name} (${mintShort}): ${adv.reason?.message || "unknown"}`);
+        if (price.status === "rejected")    log("okx", `price-info error for ${p.name} (${mintShort}): ${price.reason?.message || "unknown"}`);
+        if (clusters.status === "rejected") log("okx", `cluster-list error for ${p.name} (${mintShort}): ${clusters.reason?.message || "unknown"}`);
+        if (risk.status === "rejected")     log("okx", `risk-check error for ${p.name} (${mintShort}): ${risk.reason?.message || "unknown"}`);
 
         return {
           adv: adv.status === "fulfilled" ? adv.value : null,
