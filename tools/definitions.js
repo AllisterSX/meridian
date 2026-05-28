@@ -7,15 +7,18 @@ export const tools = [
     function: {
       name: "discover_pools",
       description: `Fetch top DLMM pools from the Meteora Pool Discovery API.
-Pools are pre-filtered for safety:
+Pools are pre-filtered using the active screening config:
 - No critical warnings on base/quote tokens
 - No high single ownership on base token
-- Base token market cap >= $150k
-- Base token holders >= 100
-- Volume >= $1k (in timeframe)
-- Active TVL >= $10k
-- Fee/Active TVL ratio >= 0.01 (in timeframe)
-- Both tokens organic score >= 60
+- Base token market cap >= minMcap
+- Base token holders >= minHolders
+- Target pool volume >= minVolume in the selected timeframe
+- Target pool TVL between minTvl and maxTvl
+- Fee/Active TVL ratio >= minFeeActiveTvlRatio in the selected timeframe
+- Base token organic score >= minOrganic
+- Quote token organic score >= minQuoteOrganic
+- DLMM bin_step between minBinStep and maxBinStep
+- Optional token age and launchpad filters from config
 
 Returns condensed pool data: address, name, tokens, bin_step, fee_pct,
 active_tvl, fee_window, volume_window, fee_tvl_ratio, volatility from max(timeframe, 30m), organic_score,
@@ -64,6 +67,44 @@ Use this instead of discover_pools for screening cycles. The active screening so
             description: "Number of top candidates to return. Default 3."
           }
         }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_chart_indicators",
+      description: `Fetch technical chart indicators (RSI, Bollinger Bands, Supertrend) for a token mint.
+Call this BEFORE deploying to inform strategy selection (bid_ask vs spot) and range width (bins_below).
+
+Returns per-interval data: RSI value, Bollinger Band position, Supertrend direction and break signals.
+Use the results to justify your deploy strategy:
+
+STRATEGY SELECTION:
+- bid_ask → best when RSI is neutral (35–65) AND Supertrend is bullish. Concentrates liquidity at current price for maximum fee capture during sustained momentum.
+- spot → better when RSI is extreme (oversold <35 or overbought >70), or Supertrend is bearish/uncertain. Flat distribution is safer when reversion is likely.
+
+RANGE WIDTH (bins_below):
+- Tight (35–45 bins): RSI 40–60, narrow Bollinger bands, stable supertrend → price is range-bound, tight is efficient
+- Standard (45–55 bins): typical market conditions
+- Wide (55–69 bins): RSI at extremes, wide Bollinger bands, high volatility → need buffer against drawdown
+
+Always explain your strategy choice referencing the indicator data.`,
+      parameters: {
+        type: "object",
+        properties: {
+          mint: {
+            type: "string",
+            description: "Base token mint address to fetch indicators for"
+          },
+          intervals: {
+            type: "array",
+            items: { type: "string", enum: ["5_MINUTE", "15_MINUTE"] },
+            description: "Timeframe intervals to fetch. Default: [\"5_MINUTE\", \"15_MINUTE\"]. Use both for cross-timeframe confirmation."
+          }
+        },
+        required: ["mint"]
       }
     }
   },
@@ -191,6 +232,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
           volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
+          volume_window: { type: "number", description: "Pool volume from the current screening timeframe. Pass this from the candidate metrics when available." },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
@@ -386,7 +428,7 @@ WARNING: This executes a real on-chain transaction.`,
 Non-GMGN changes persist to user-config.json; GMGN tuning persists to gmgn-config.json. Changes take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: screeningSource, minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, useDiscordSignals, discordSignalMode, avoidPvpSymbols, blockPvpSymbols, maxBundlePct, maxBotHoldersPct, maxTop10Pct, allowedLaunchpads, blockedLaunchpads, minTokenAgeHours, maxTokenAgeHours, athFilterPct
+Screening: screeningSource, minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, useDiscordSignals, discordSignalMode, avoidPvpSymbols, blockPvpSymbols, maxBundlePct, maxSniperPct, maxBotHoldersPct, maxTop10Pct, allowedLaunchpads, blockedLaunchpads, minTokenAgeHours, maxTokenAgeHours, athFilterPct
 GMGN (persisted to gmgn-config.json): gmgnApiKey, gmgnBaseUrl, gmgnInterval, gmgnOrderBy, gmgnDirection, gmgnLimit, gmgnEnrichLimit, gmgnRequestDelayMs, gmgnMaxRetries, gmgnHoldersLimit, gmgnKlineResolution, gmgnKlineLookbackMinutes, gmgnFilters, gmgnPlatforms, gmgnMinMcap, gmgnMaxMcap, gmgnMinVolume, gmgnMinHolders, gmgnMinTokenAgeHours, gmgnMaxTokenAgeHours, gmgnAthFilterPct, gmgnMaxTop10HolderRate, gmgnMaxBundlerRate, gmgnMaxRatTraderRate, gmgnMaxFreshWalletRate, gmgnMaxDevTeamHoldRate, gmgnMaxBotDegenRate, gmgnMaxSniperCount, gmgnMaxSniperHoldRate, gmgnPreferredKolNames, gmgnPreferredKolMinHoldPct, gmgnDumpKolNames, gmgnDumpKolMinHoldPct, gmgnRequireKol, gmgnMinKolCount, gmgnMinSmartDegenCount, gmgnMinTotalFeeSol, gmgnIndicatorFilter, gmgnIndicatorInterval, gmgnRequireBullishSupertrend, gmgnRejectAlreadyAtBottom, gmgnRequireAboveSupertrend, gmgnMinRsi, gmgnMaxRsi, gmgnRequireBbPosition
 Management: minClaimAmount, autoSwapAfterClaim, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, pnlSanityMaxDiffPct, solMode, minSolToOpen, deployAmountSol, gasReserve, positionSizePct, minAgeBeforeYieldCheck
 Risk: maxPositions, maxDeployAmount
@@ -543,7 +585,7 @@ is_pool=true means it's a liquidity pool address, not a real holder — filter t
 
 Also returns global_fees_sol — total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees).
 This is a key signal: low global_fees_sol means transactions are bundled or the token is a scam.
-HARD GATE: if global_fees_sol < config.screening.minTokenFeesSol (default 30), do NOT deploy.
+HARD GATE: if global_fees_sol < config.screening.minTokenFeesSol (default 15), do NOT deploy.
 
 NOTE: Requires mint address. If you only have a symbol/name, call get_token_info first to resolve the mint.`,
       parameters: {
@@ -975,7 +1017,7 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
 Returns all past deploys, PnL, win rate, and any notes you've added.
 
 Call this tool before deploying to any pool — you may have been here before and it didn't work.
-Also useful during screening to skip pools with a bad track record.`,
+Also useful during screening to skip pools with a bad track record. OOR closes with positive realized PnL are profitable momentum exits, not bad-track-record evidence by themselves.`,
       parameters: {
         type: "object",
         properties: {
@@ -1059,6 +1101,23 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
           }
         },
         required: ["mint"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_lp_overview",
+      description: "Get your aggregate LP performance stats from LP Agent API: total PnL, fees earned, win rate, ROI, average hold time, position counts. Useful for reviewing overall performance before deploying or after a run.",
+      parameters: {
+        type: "object",
+        properties: {
+          force: {
+            type: "boolean",
+            description: "Bypass 5-minute cache and fetch fresh data. Default false."
+          }
+        }
       }
     }
   },

@@ -1,4 +1,6 @@
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { fetchChartIndicatorsForMint } from "./chart-indicators.js";
+import { getLpOverview } from "./lp-overview.js";
 import {
   getActiveBin,
   deployPosition,
@@ -22,6 +24,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
+import { fetchFreshGmgnRankVolume } from "./gmgn.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -101,6 +104,37 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 }
 
 async function validateDeployPoolThresholds(args) {
+  const isGmgnScreening = String(config.screening.source || "").toLowerCase() === "gmgn";
+  if (isGmgnScreening) {
+    const baseMint = args.base_mint || args.mint || null;
+    if (!baseMint) {
+      return {
+        pass: false,
+        reason: "Could not verify GMGN volume before deploy: missing base_mint.",
+      };
+    }
+    let gmgnVolume = null;
+    try {
+      gmgnVolume = await fetchFreshGmgnRankVolume(baseMint);
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not verify GMGN volume before deploy: ${error.message}`,
+      };
+    }
+    const minGmgnVolume = numberOrNull(config.gmgn?.minVolume ?? config.screening.minVolume);
+    if (
+      minGmgnVolume != null &&
+      minGmgnVolume > 0 &&
+      (gmgnVolume == null || gmgnVolume < minGmgnVolume)
+    ) {
+      return {
+        pass: false,
+        reason: `GMGN ${config.gmgn?.interval || "5m"} volume $${gmgnVolume ?? "unknown"} is below configured gmgn.minVolume $${minGmgnVolume}.`,
+      };
+    }
+  }
+
   let detail;
   try {
     detail = await fetchFreshPoolDetail(args.pool_address);
@@ -195,6 +229,101 @@ export function registerCronRestarter(fn) { _cronRestarter = fn; }
 const toolMap = {
   discover_pools: discoverPools,
   get_top_candidates: getTopCandidates,
+  get_chart_indicators: async ({ mint, intervals } = {}) => {
+    if (!mint) return { error: "mint is required" };
+    const targets = Array.isArray(intervals) && intervals.length > 0
+      ? intervals
+      : ["5_MINUTE", "15_MINUTE"];
+    const results = [];
+    for (const interval of targets) {
+      try {
+        const payload = await fetchChartIndicatorsForMint(mint, { interval });
+        const latest = payload?.latest || {};
+        const candle = latest?.candle || {};
+        const rsi = latest?.rsi?.value != null ? Number(latest.rsi.value) : null;
+        const bollinger = latest?.bollinger || {};
+        const supertrend = latest?.supertrend || {};
+        const close = candle.close != null ? Number(candle.close) : null;
+        const lower = bollinger.lower != null ? Number(bollinger.lower) : null;
+        const upper = bollinger.upper != null ? Number(bollinger.upper) : null;
+        const middle = bollinger.middle != null ? Number(bollinger.middle) : null;
+        const stVal = supertrend.value != null ? Number(supertrend.value) : null;
+        const stDir = String(supertrend.direction || "unknown");
+        const states = latest?.states || {};
+
+        let bollingerZone = "middle";
+        if (close != null && lower != null && upper != null) {
+          if (close <= lower) bollingerZone = "at_or_below_lower";
+          else if (close >= upper) bollingerZone = "at_or_above_upper";
+          else if (close < middle) bollingerZone = "lower_half";
+          else bollingerZone = "upper_half";
+        }
+
+        let rsiZone = "neutral";
+        if (rsi != null) {
+          if (rsi <= 30) rsiZone = "oversold";
+          else if (rsi <= 40) rsiZone = "weak";
+          else if (rsi >= 80) rsiZone = "overbought";
+          else if (rsi >= 65) rsiZone = "strong";
+        }
+
+        results.push({
+          interval, ok: true, close, rsi, rsiZone,
+          bollingerLower: lower, bollingerMiddle: middle, bollingerUpper: upper, bollingerZone,
+          supertrendDirection: stDir, supertrendValue: stVal,
+          supertrendBreakUp: !!states.supertrendBreakUp, supertrendBreakDown: !!states.supertrendBreakDown,
+        });
+      } catch (err) {
+        results.push({ interval, ok: false, error: err.message });
+      }
+    }
+
+    const successful = results.filter((r) => r.ok);
+    const bullishCount = successful.filter((r) => r.supertrendDirection === "bullish").length;
+    const bearishCount = successful.filter((r) => r.supertrendDirection === "bearish").length;
+    const avgRsi = successful.length > 0
+      ? Math.round(successful.reduce((s, r) => s + (r.rsi ?? 50), 0) / successful.length)
+      : null;
+    const oversoldAny = successful.some((r) => r.rsiZone === "oversold");
+    const overboughtAny = successful.some((r) => r.rsiZone === "overbought");
+    const breakUpAny = successful.some((r) => r.supertrendBreakUp);
+    const breakDownAny = successful.some((r) => r.supertrendBreakDown);
+    const atLowerBandAny = successful.some((r) => r.bollingerZone === "at_or_below_lower");
+    const atUpperBandAny = successful.some((r) => r.bollingerZone === "at_or_above_upper");
+
+    let strategySuggestion = "spot";
+    let rangeSuggestion = "standard (45–55 bins)";
+    let reasoning = [];
+
+    if (bullishCount === successful.length && avgRsi != null && avgRsi >= 35 && avgRsi <= 65) {
+      strategySuggestion = "bid_ask";
+      reasoning.push(`Supertrend bullish across all intervals, RSI neutral at ${avgRsi} — momentum is sustained, bid_ask maximises fee capture`);
+    } else if (bearishCount > 0 || overboughtAny) {
+      strategySuggestion = "spot";
+      reasoning.push(bearishCount > 0 ? "Supertrend bearish on ≥1 interval" : `RSI overbought (avg ${avgRsi}) — reversion risk, spot gives wider safety buffer`);
+    } else if (oversoldAny || atLowerBandAny) {
+      strategySuggestion = "spot";
+      reasoning.push(`${oversoldAny ? `RSI oversold (avg ${avgRsi})` : "Price at Bollinger lower band"} — potential reversion entry, spot distribution preferred`);
+    } else if (bullishCount > 0) {
+      strategySuggestion = "bid_ask";
+      reasoning.push(`Supertrend bullish on ${bullishCount}/${successful.length} intervals — leaning bid_ask for momentum`);
+    }
+
+    if (breakUpAny) { reasoning.push("Supertrend just flipped bullish — strong entry signal"); strategySuggestion = "bid_ask"; }
+    if (breakDownAny) { reasoning.push("Supertrend just flipped bearish — consider skipping or tightening range"); strategySuggestion = "spot"; }
+
+    if (oversoldAny || atLowerBandAny || overboughtAny || atUpperBandAny) {
+      rangeSuggestion = "wide (55–69 bins)";
+    } else if (avgRsi != null && avgRsi >= 40 && avgRsi <= 60 && bullishCount === successful.length) {
+      rangeSuggestion = "tight (35–45 bins)";
+    }
+
+    return {
+      intervals: results,
+      summary: { avgRsi, bullishIntervals: bullishCount, bearishIntervals: bearishCount, supertrendBreakUp: breakUpAny, supertrendBreakDown: breakDownAny, rsiOversold: oversoldAny, rsiOverbought: overboughtAny, priceAtLowerBand: atLowerBandAny, priceAtUpperBand: atUpperBandAny },
+      recommendation: { strategy: strategySuggestion, range: rangeSuggestion, reasoning: reasoning.join("; ") || "Mixed signals — use default strategy and standard range" },
+    };
+  },
   get_pool_detail: getPoolDetail,
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
@@ -305,6 +434,8 @@ const toolMap = {
       minBinStep: ["screening", "minBinStep"],
       maxBinStep: ["screening", "maxBinStep"],
       timeframe: ["screening", "timeframe"],
+      feesTimeframe: ["screening", "feesTimeframe"],
+      poolFeesTimeframe: ["screening", "feesTimeframe"],
       category: ["screening", "category"],
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
       useDiscordSignals: ["screening", "useDiscordSignals"],
@@ -312,6 +443,7 @@ const toolMap = {
       avoidPvpSymbols: ["screening", "avoidPvpSymbols"],
       blockPvpSymbols: ["screening", "blockPvpSymbols"],
       maxBundlePct:     ["screening", "maxBundlePct"],
+      maxSniperPct:     ["screening", "maxSniperPct"],
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
       allowedLaunchpads: ["screening", "allowedLaunchpads"],
@@ -564,6 +696,12 @@ const toolMap = {
     log("config", `Agent self-tuned: ${JSON.stringify(redactAppliedConfig(applied))} — ${reason}`);
     return { success: true, applied: redactAppliedConfig(applied), unknown, reason };
   },
+
+  get_lp_overview: async ({ force = false } = {}) => {
+    const data = await getLpOverview({ force });
+    if (!data) return { error: "LP Agent API unavailable or LPAGENT_API_KEY not set" };
+    return data;
+  },
 };
 
 // Tools that modify on-chain state (need extra safety checks)
@@ -627,7 +765,7 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, solMode: config.management.solMode }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;

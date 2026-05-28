@@ -38,7 +38,18 @@ function save(data) {
 
 function isOorCloseReason(reason) {
   const text = String(reason || "").trim().toLowerCase();
-  return text === "oor" || text.includes("out of range") || text.includes("oor");
+  return text === "oor" ||
+    text.includes("out of range") ||
+    text.includes("oor") ||
+    text.includes("pumped far above range");
+}
+
+function isProfitableOorDeploy(deploy) {
+  return isOorCloseReason(deploy?.close_reason) && Number(deploy?.pnl_pct ?? 0) > 0;
+}
+
+function isAdverseOorDeploy(deploy) {
+  return isOorCloseReason(deploy?.close_reason) && !isProfitableOorDeploy(deploy);
 }
 
 function isAdjustedWinRateExcludedReason(reason) {
@@ -47,6 +58,10 @@ function isAdjustedWinRateExcludedReason(reason) {
     text.includes("pumped far above range") ||
     text === "oor" ||
     text.includes("oor");
+}
+
+function isAdjustedWinRateExcludedDeploy(deploy) {
+  return isAdjustedWinRateExcludedReason(deploy?.close_reason) && !isProfitableOorDeploy(deploy);
 }
 
 function isFeeGeneratingDeploy(deploy) {
@@ -151,7 +166,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
       (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 100
     ) / 100;
   }
-  const adjusted = withPnl.filter((d) => !isAdjustedWinRateExcludedReason(d.close_reason));
+  const adjusted = withPnl.filter((d) => !isAdjustedWinRateExcludedDeploy(d));
   entry.adjusted_win_rate_sample_count = adjusted.length;
   entry.adjusted_win_rate = adjusted.length > 0
     ? Math.round((adjusted.filter((d) => d.pnl_pct >= 0).length / adjusted.length) * 10000) / 100
@@ -173,7 +188,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
   const repeatedOorCloses =
     recentDeploys.length >= oorTriggerCount &&
-    recentDeploys.every((d) => isOorCloseReason(d.close_reason));
+    recentDeploys.every((d) => isAdverseOorDeploy(d));
 
   if (repeatedOorCloses) {
     const reason = `repeated OOR closes (${oorTriggerCount}x)`;
@@ -270,6 +285,9 @@ export function getPoolMemory({ pool_address }) {
     cooldown_reason: entry.cooldown_reason || null,
     base_mint_cooldown_until: entry.base_mint_cooldown_until || null,
     base_mint_cooldown_reason: entry.base_mint_cooldown_reason || null,
+    profitable_oor_exits: entry.deploys.filter(isProfitableOorDeploy).length,
+    adverse_oor_exits: entry.deploys.filter(isAdverseOorDeploy).length,
+    oor_guidance: "OOR exits with positive realized PnL are profitable momentum exits, not skip evidence by themselves.",
     notes: entry.notes,
     history: entry.deploys.slice(-10), // last 10 deploys
   };
@@ -337,6 +355,12 @@ export function recallForPool(poolAddress) {
   // Deploy history summary
   if (entry.total_deploys > 0) {
     lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+
+    const profitableOor = entry.deploys.filter(isProfitableOorDeploy).length;
+    const adverseOor = entry.deploys.filter(isAdverseOorDeploy).length;
+    if (profitableOor > 0 || adverseOor > 0) {
+      lines.push(`OOR CONTEXT: ${profitableOor} profitable OOR exit(s), ${adverseOor} adverse OOR exit(s). Profitable OOR means momentum exit, not a pool skip reason.`);
+    }
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {
@@ -356,7 +380,8 @@ export function recallForPool(poolAddress) {
       ? (last.pnl_pct - first.pnl_pct).toFixed(2)
       : null;
     const oorCount = snaps.filter(s => s.in_range === false).length;
-    lines.push(`RECENT TREND: PnL drift ${pnlTrend !== null ? (pnlTrend >= 0 ? "+" : "") + pnlTrend + "%" : "unknown"} over last ${snaps.length} cycles, OOR in ${oorCount}/${snaps.length} cycles`);
+    const latestOorPositive = last.in_range === false && Number(last.pnl_pct ?? 0) > 0;
+    lines.push(`RECENT TREND: PnL drift ${pnlTrend !== null ? (pnlTrend >= 0 ? "+" : "") + pnlTrend + "%" : "unknown"} over last ${snaps.length} cycles, OOR in ${oorCount}/${snaps.length} cycles${latestOorPositive ? " (latest OOR PnL positive; do not treat as skip by itself)" : ""}`);
   }
 
   // Notes
@@ -402,4 +427,41 @@ export function addPoolNote({ pool_address, note }) {
   save(db);
   log("pool-memory", `Note added to ${pool_address.slice(0, 8)}: ${safeNote}`);
   return { saved: true, pool_address, note: safeNote };
+}
+
+/**
+ * Purge stale pool-memory snapshots — pools with no active position for 24h.
+ * Called automatically at the start of each management cycle (cheap read+write,
+ * no LLM involved). Keeps pool-memory.json lean at all times.
+ *
+ * @returns {{ pools_checked, snapshots_cleared }}
+ */
+export function purgeStaleSnapshots() {
+  const db = load();
+  const now = new Date();
+  const staleCutoff = 24 * 60 * 60 * 1000; // 24 hours in ms
+
+  let poolsChecked = 0;
+  let snapshotsCleared = 0;
+
+  for (const entry of Object.values(db)) {
+    if (!entry.snapshots?.length) continue;
+    poolsChecked++;
+
+    // Find the most recent snapshot timestamp
+    const lastSnap = entry.snapshots[entry.snapshots.length - 1];
+    const lastSnapAge = now - new Date(lastSnap.ts || 0);
+
+    if (lastSnapAge > staleCutoff) {
+      snapshotsCleared += entry.snapshots.length;
+      entry.snapshots = [];
+    }
+  }
+
+  if (snapshotsCleared > 0) {
+    save(db);
+    log("pool-memory", `purgeStaleSnapshots: cleared ${snapshotsCleared} stale snapshots across ${poolsChecked} pools`);
+  }
+
+  return { pools_checked: poolsChecked, snapshots_cleared: snapshotsCleared };
 }
