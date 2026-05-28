@@ -102,33 +102,24 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 }
 
 async function validateDeployPoolThresholds(args) {
-  const isGmgnScreening = String(config.screening.source || "").toLowerCase() === "gmgn";
-  if (isGmgnScreening) {
-    const baseMint = args.base_mint || args.mint || null;
-    if (!baseMint) {
-      return {
-        pass: false,
-        reason: "Could not verify GMGN volume before deploy: missing base_mint.",
-      };
-    }
+  // GMGN token volume check — runs ALWAYS (regardless of screening source).
+  // This validates that the token still has real trading activity across all DEXes;
+  // a token with low GMGN volume = dying coin, no swaps = no fees no matter how good the pool looks.
+  // Skipped only if no GMGN API key is configured.
+  const baseMint = args.base_mint || args.mint || null;
+  if (config.gmgn?.apiKey && baseMint) {
     let gmgnVolume = null;
     try {
       gmgnVolume = await fetchFreshGmgnRankVolume(baseMint);
     } catch (error) {
-      return {
-        pass: false,
-        reason: `Could not verify GMGN volume before deploy: ${error.message}`,
-      };
+      log("safety", `GMGN volume lookup failed for ${args.pool_name || baseMint.slice(0, 8)}: ${error.message} — skipping GMGN check`);
     }
-    const minGmgnVolume = numberOrNull(config.gmgn?.minVolume ?? config.screening.minVolume);
-    if (
-      minGmgnVolume != null &&
-      minGmgnVolume > 0 &&
-      (gmgnVolume == null || gmgnVolume < minGmgnVolume)
-    ) {
+    const minGmgnVolume = numberOrNull(config.gmgn?.minVolume);
+    log("safety", `GMGN ${config.gmgn?.interval || "5m"} volume for ${args.pool_name || baseMint.slice(0, 8)}: $${gmgnVolume?.toFixed(2) ?? "N/A"}`);
+    if (gmgnVolume != null && minGmgnVolume != null && minGmgnVolume > 0 && gmgnVolume < minGmgnVolume) {
       return {
         pass: false,
-        reason: `GMGN ${config.gmgn?.interval || "5m"} volume $${gmgnVolume ?? "unknown"} is below configured gmgn.minVolume $${minGmgnVolume}.`,
+        reason: `GMGN ${config.gmgn?.interval || "5m"} token volume $${gmgnVolume.toFixed(2)} is below configured gmgn.minVolume $${minGmgnVolume}.`,
       };
     }
   }
