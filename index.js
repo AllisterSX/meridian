@@ -212,7 +212,8 @@ let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _closedNotifSent = new Set(); // dedup close-position Telegram notifications (cleared daily)
-const _peakConfirmTimers = new Map();const _trailingDropConfirmTimers = new Map();
+const _peakConfirmTimers = new Map();
+const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
