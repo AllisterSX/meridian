@@ -77,7 +77,10 @@ async function gmgnFetch(pathname, { method = "GET", params = {}, body = null } 
     }
     const message = payload?.message || payload?.error || payload?.raw || `GMGN ${pathname} ${res.status}`;
     const rateLimited = res.status === 429 || /rate limit|temporarily banned/i.test(String(message));
-    if (res.ok) return payload;
+    if (res.ok && (payload?.code == null || payload.code === 0)) return payload;
+    if (res.ok && payload?.code != null && payload.code !== 0) {
+      throw new Error(message);
+    }
     if (rateLimited && attempt < maxRetries) {
       const retryAfter = Number(res.headers.get("retry-after"));
       const backoffMs = Number.isFinite(retryAfter)
@@ -91,6 +94,13 @@ async function gmgnFetch(pathname, { method = "GET", params = {}, body = null } 
     throw new Error(message);
   }
   throw new Error(`GMGN ${pathname} failed`);
+}
+
+export async function getGmgnTokenInfo(mint) {
+  const payload = await gmgnFetch("/v1/token/info", {
+    params: { chain: "sol", address: mint },
+  });
+  return payload?.data?.data || payload?.data || payload;
 }
 
 function unwrapList(payload, keys = ["list", "rank", "data"]) {
@@ -123,6 +133,44 @@ function ratioPct(value) {
   const n = optionalNum(value);
   if (n == null) return null;
   return Number((n * 100).toFixed(2));
+}
+
+function rankVolume(token) {
+  const interval = normalizeInterval(config.gmgn?.interval, "5m");
+  const intervalKey = interval.replace(/[^a-z0-9]/gi, "");
+  const candidates = [
+    token?.[`volume_${interval}`],
+    token?.[`volume_${intervalKey}`],
+    token?.[`volume${intervalKey}`],
+    token?.[`volume_${interval.toUpperCase()}`],
+    token?.[`volume${intervalKey.toUpperCase()}`],
+    token?.volume,
+  ];
+  for (const value of candidates) {
+    const n = optionalNum(value);
+    if (n != null) return n;
+  }
+  return 0;
+}
+
+export async function fetchFreshGmgnRankVolume(mint, { interval = config.gmgn?.interval } = {}) {
+  const normalizedInterval = normalizeInterval(interval, "5m");
+  const rankPayload = await gmgnFetch("/v1/market/rank", {
+    params: {
+      chain: "sol",
+      interval: normalizedInterval,
+      order_by: config.gmgn?.orderBy || "volume",
+      direction: config.gmgn?.direction || "desc",
+      limit: Math.min(100, Math.max(1, Number(config.gmgn?.limit || 100))),
+      filters: config.gmgn?.filters || [],
+      platforms: config.gmgn?.platforms || [],
+    },
+  });
+  const ranked = unwrapList(rankPayload, ["rank", "list", "data"]);
+  const target = String(mint || "").trim();
+  const token = ranked.find((entry) => String(entry?.address || "").trim() === target);
+  if (!token) return null;
+  return rankVolume(token);
 }
 
 function hasTag(entry, tag) {
@@ -177,7 +225,8 @@ function passBasicRankFilter(token) {
   if (g.maxTokenAgeHours != null && tokenAgeHours != null && tokenAgeHours > g.maxTokenAgeHours) {
     reasons.push(`age ${tokenAgeHours.toFixed(2)}h > ${g.maxTokenAgeHours}h`);
   }
-  if (num(token.volume) < g.minVolume) reasons.push(`volume ${num(token.volume)} < ${g.minVolume}`);
+  const volume = rankVolume(token);
+  if (volume < g.minVolume) reasons.push(`volume ${volume} < ${g.minVolume}`);
   return { pass: reasons.length === 0, reasons };
 }
 
@@ -362,10 +411,12 @@ function condenseGmgnCandidate({ token, pool, poolDetail, security, info, infoAn
   const feeActiveTvlRatio = Number.isFinite(Number(poolDetail?.fee_active_tvl_ratio))
     ? Number(Number(poolDetail.fee_active_tvl_ratio).toFixed(4))
     : null;
+  const tokenVolume = rankVolume(token);
+  const poolWindowVolume = round(poolDetail?.volume);
   const kolCount = holdersAnalysis.kolHolding || num(token.renowned_count) || num(info?.wallet_tags_stat?.renowned_wallets);
   const smartCount = holdersAnalysis.smartHolding + holdersAnalysis.smartAccumulating || num(token.smart_degen_count) || num(info?.wallet_tags_stat?.smart_wallets);
   const gmgnScore =
-    num(token.volume) / 100 +
+    tokenVolume / 100 +
     num(token.smart_degen_count) * 50 +
     kolCount * 35 +
     num(holdersAnalysis?.preferredKolHolding) * 75 -
@@ -403,7 +454,9 @@ function condenseGmgnCandidate({ token, pool, poolDetail, security, info, infoAn
     dev: info.dev?.creator_address || null,
     price: num(info.price || token.price),
     price_change_pct: num(token.price_change_percent5m ?? token.price_change_percent),
-    volume: num(token.volume ?? 0),
+    volume: tokenVolume,
+    gmgn_volume: tokenVolume,
+    volume_window: poolWindowVolume,
     swap_count: token.swaps ?? null,
     gmgn: true,
     gmgn_score: Number(gmgnScore.toFixed(2)),
