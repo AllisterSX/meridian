@@ -105,9 +105,9 @@ async function validateDeployPoolThresholds(args) {
   // GMGN token volume check — runs ALWAYS (regardless of screening source).
   // This validates that the token still has real trading activity across all DEXes;
   // a token with low GMGN volume = dying coin, no swaps = no fees no matter how good the pool looks.
-  // Skipped only if no GMGN API key is configured.
+  // GMGN /v1/token/info is a public endpoint — no API key required.
   const baseMint = args.base_mint || args.mint || null;
-  if (config.gmgn?.apiKey && baseMint) {
+  if (baseMint) {
     let gmgnVolume = null;
     try {
       gmgnVolume = await fetchFreshGmgnRankVolume(baseMint);
