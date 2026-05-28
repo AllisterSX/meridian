@@ -9,6 +9,7 @@ import { discoverGmgnPools } from "./gmgn.js";
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const SCREENING_FETCH_TIMEOUT_MS = 15_000; // 15s — any external request taking longer is considered hung
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -30,8 +31,23 @@ function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
-function scoreCandidate(pool) {
-  if (Number.isFinite(Number(pool.gmgn_score))) {
+/**
+ * fetch() with a hard timeout — prevents hung requests from blocking _screeningBusy indefinitely.
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = SCREENING_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: options.signal ?? controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`request timeout after ${timeoutMs}ms: ${url}`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function scoreCandidate(pool) {  if (Number.isFinite(Number(pool.gmgn_score))) {
     return Number(pool.gmgn_score) + Number(pool.fee_active_tvl_ratio || 0) * 500;
   }
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
@@ -163,7 +179,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
 }
 
 async function fetchDiscordSignalCandidates() {
-  const res = await fetch(`${config.api.url}/signals/discord/candidates`, {
+  const res = await fetchWithTimeout(`${config.api.url}/signals/discord/candidates`, {
     headers: config.api.publicApiKey ? { "x-api-key": config.api.publicApiKey } : {},
   });
   if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
@@ -178,7 +194,7 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
     `&timeframe=${timeframe}` +
     `&category=${category}`;
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -194,7 +210,7 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe, category = con
     `&timeframe=${encodeURIComponent(timeframe)}` +
     (category ? `&category=${encodeURIComponent(category)}` : "");
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
 
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
@@ -271,7 +287,7 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
 }
 
 async function searchAssetsBySymbol(symbol) {
-  const res = await fetch(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
+  const res = await fetchWithTimeout(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
   if (!res.ok) throw new Error(`assets/search ${res.status}`);
   const data = await res.json();
   return Array.isArray(data) ? data : [data];
@@ -327,7 +343,7 @@ async function enrichDiscordSignalLaunchpads(rawPools) {
 
 async function findRivalPool(mint) {
   const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   if (!res.ok) throw new Error(`rival pool search ${res.status}`);
   const data = await res.json();
   const pools = Array.isArray(data?.data) ? data.data : [];

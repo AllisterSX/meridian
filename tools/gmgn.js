@@ -67,6 +67,7 @@ async function gmgnFetch(pathname, { method = "GET", params = {}, body = null } 
         "Content-Type": "application/json",
       },
       body: body ? JSON.stringify(body) : null,
+      signal: AbortSignal.timeout(15_000),
     });
     const text = await res.text().catch(() => "");
     let payload = {};
@@ -358,7 +359,7 @@ function analyzeHoldersAndTraders(holders = [], traders = []) {
 async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
   const filterBy = minTvl > 0 ? `&filter_by=${encodeURIComponent(`tvl>${minTvl}`)}` : "";
   const url = `${METEORA_DLMM_API}/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}${filterBy}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`Meteora pool search ${res.status}`);
   const data = await res.json();
   const pools = Array.isArray(data?.data) ? data.data : [];
@@ -381,7 +382,7 @@ async function fetchPoolDetailDirect(poolAddress) {
   // (api.agentmeridian.xyz) returns stale/fee=0 data for some pools.
   const discoveryBase = "https://pool-discovery-api.datapi.meteora.ag";
   const url = `${discoveryBase}/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=5m`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) return null;
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
