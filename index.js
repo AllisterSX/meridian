@@ -811,6 +811,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      const top10Pct = ti?.audit?.top_holders_pct;
+      const maxTop10Pct = config.screening.maxTop10Pct;
+      if (top10Pct != null && maxTop10Pct != null && top10Pct > maxTop10Pct) {
+        log("screening", `Top10-holder filter: dropped ${pool.name} — top10 ${top10Pct}% > ${maxTop10Pct}%`);
+        filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% > ${maxTop10Pct}%` });
+        return false;
+      }
       // DLMM supply trap filter — skip if Meteora pools already hold too much of the supply
       const maxDlmmPct = config.screening.maxDlmmSupplyPct ?? 2;
       if (dlmmSupply?.pct > maxDlmmPct) {
