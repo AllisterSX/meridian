@@ -111,7 +111,7 @@ export const config = {
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct !== undefined ? u.athFilterPct : null, // null = disabled; negative = only deploy if price is that % below ATH
     maxDlmmSupplyPct:   u.maxDlmmSupplyPct   ?? 2,   // max % of token supply held by ALL Meteora DLMM pools combined
-    maxPriceDropPct:    u.maxPriceDropPct    ?? -25, // block deploy if price dropped more than this % in active timeframe (dump detection)
+    maxPriceDropPct:    u.maxPriceDropPct    ?? -15, // block deploy if price dropped more than this % in active timeframe (dump detection)
   },
 
   gmgn: {

@@ -109,17 +109,40 @@ async function validateDeployPoolThresholds(args) {
   const baseMint = args.base_mint || args.mint || null;
   if (baseMint) {
     let gmgnVolume = null;
+    let gmgnPriceChange5m = null;
     try {
-      gmgnVolume = await fetchFreshGmgnRankVolume(baseMint);
+      const { getGmgnTokenInfo } = await import("./gmgn.js");
+      const info = await getGmgnTokenInfo(baseMint);
+      const priceNow = numberOrNull(info?.price?.price);
+      const price5mAgo = numberOrNull(info?.price?.price_5m);
+      if (priceNow != null && price5mAgo != null && price5mAgo > 0) {
+        gmgnPriceChange5m = ((priceNow - price5mAgo) / price5mAgo) * 100;
+      }
+      // Reuse the same info for volume (avoids double fetch)
+      const priceBlock = info?.price || {};
+      const interval = (config.gmgn?.interval || "5m").replace(/[^a-z0-9]/gi, "");
+      const volKey = `volume_${interval}`;
+      gmgnVolume = numberOrNull(priceBlock[volKey]) ?? numberOrNull(priceBlock.volume_5m) ?? null;
     } catch (error) {
-      log("safety", `GMGN volume lookup failed for ${args.pool_name || baseMint.slice(0, 8)}: ${error.message} — skipping GMGN check`);
+      log("safety", `GMGN check failed for ${args.pool_name || baseMint.slice(0, 8)}: ${error.message} — skipping GMGN checks`);
     }
+
     const minGmgnVolume = numberOrNull(config.gmgn?.minVolume);
-    log("safety", `GMGN ${config.gmgn?.interval || "5m"} volume for ${args.pool_name || baseMint.slice(0, 8)}: $${gmgnVolume?.toFixed(2) ?? "N/A"}`);
+    log("safety", `GMGN 5m volume for ${args.pool_name || baseMint.slice(0, 8)}: $${gmgnVolume?.toFixed(2) ?? "N/A"}`);
     if (gmgnVolume != null && minGmgnVolume != null && minGmgnVolume > 0 && gmgnVolume < minGmgnVolume) {
       return {
         pass: false,
         reason: `GMGN ${config.gmgn?.interval || "5m"} token volume $${gmgnVolume.toFixed(2)} is below configured gmgn.minVolume $${minGmgnVolume}.`,
+      };
+    }
+
+    // GMGN price dump check — block if token is actively dumping right now
+    const maxDrop = numberOrNull(config.screening.maxPriceDropPct) ?? -15;
+    if (gmgnPriceChange5m != null && gmgnPriceChange5m <= maxDrop) {
+      log("safety", `GMGN dump check: ${args.pool_name || baseMint.slice(0, 8)} price_change_5m ${gmgnPriceChange5m.toFixed(2)}% <= ${maxDrop}%`);
+      return {
+        pass: false,
+        reason: `GMGN 5m price change ${gmgnPriceChange5m.toFixed(2)}% is below maxPriceDropPct ${maxDrop}% — token is actively dumping.`,
       };
     }
   }
