@@ -111,6 +111,7 @@ export const config = {
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct !== undefined ? u.athFilterPct : null, // null = disabled; negative = only deploy if price is that % below ATH
     maxDlmmSupplyPct:   u.maxDlmmSupplyPct   ?? 2,   // max % of token supply held by ALL Meteora DLMM pools combined
+    maxPriceDropPct:    u.maxPriceDropPct    ?? -25, // block deploy if price dropped more than this % in active timeframe (dump detection)
   },
 
   gmgn: {
@@ -350,6 +351,7 @@ export function reloadScreeningThresholds() {
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     if (fresh.maxDlmmSupplyPct  != null) s.maxDlmmSupplyPct = fresh.maxDlmmSupplyPct;
+    if (fresh.maxPriceDropPct   != null) s.maxPriceDropPct  = fresh.maxPriceDropPct;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

@@ -777,8 +777,26 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
   }
 
-  if (config.indicators.enabled && eligible.length > 0) {
-    const confirmations = await Promise.all(
+  // Dump safety check — block pools where price is crashing in the active timeframe.
+  // Volume spike during a dump is misleading: high volume = panic selling, not fee-generating swaps.
+  // Threshold: config.screening.maxPriceDropPct (default -25). Only applied when data is available.
+  {
+    const maxDrop = config.screening.maxPriceDropPct ?? -25;
+    const before = eligible.length;
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      const priceChange = p.price_change_pct;
+      if (priceChange == null) return true; // no data → don't filter
+      if (priceChange <= maxDrop) {
+        log("screening", `Dump filter: dropped ${p.name} — price_change ${priceChange}% <= ${maxDrop}% in ${config.screening.timeframe || "5m"}`);
+        pushFilteredReason(filteredOut, p, `price dump ${priceChange}% <= ${maxDrop}% in ${config.screening.timeframe || "5m"}`);
+        return false;
+      }
+      return true;
+    }));
+    if (eligible.length < before) log("screening", `Dump filter removed ${before - eligible.length} pool(s)`);
+  }
+
+  if (config.indicators.enabled && eligible.length > 0) {    const confirmations = await Promise.all(
       eligible.map(async (pool) => {
         try {
           const confirmation = await confirmIndicatorPreset({
