@@ -166,6 +166,20 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
+  // Real-time volume check — uses the same timeframe as screening config
+  const realVol = numberOrNull(detail?.volume);
+  const minVolume = numberOrNull(config.screening.minVolume);
+  const poolLabel = args.pool_name || args.pool_address?.slice(0, 8);
+  log("safety", `Real-time ${config.screening.timeframe || "5m"} volume for ${poolLabel}: $${realVol?.toFixed(2) ?? "N/A"}`);
+  if (minVolume != null && minVolume > 0) {
+    if (realVol == null || realVol < minVolume) {
+      return {
+        pass: false,
+        reason: `Real-time ${config.screening.timeframe || "5m"} volume for ${poolLabel}: $${realVol?.toFixed(2) ?? "N/A"} — below configured minVolume $${minVolume}. Skipping deploy.`,
+      };
+    }
+  }
+
   const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
   const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
