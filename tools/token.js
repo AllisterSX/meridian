@@ -39,7 +39,9 @@ export async function getTokenInfo({ query }) {
     organic_label: t.organicScoreLabel,
     launchpad: t.launchpad,
     graduated: !!t.graduatedPool,
-    global_fees_sol: t.fees != null ? parseFloat(t.fees.toFixed(2)) : null,
+    // global_fees_sol intentionally null — populated below from GMGN total_fee only.
+    // Jupiter t.fees is token-level priority/jito tips, not LP/trade fees — not what we want.
+    global_fees_sol: null,
     audit: t.audit ? {
       mint_disabled: t.audit.mintAuthorityDisabled,
       freeze_disabled: t.audit.freezeAuthorityDisabled,
@@ -61,10 +63,25 @@ export async function getTokenInfo({ query }) {
   // Enrich first result with OKX smart money + risk data (public endpoint, no key needed)
   if (results[0]?.mint) {
     const { getAdvancedInfo, getClusterList } = await import("./okx.js");
-    const [adv, clusters] = await Promise.all([
+    const { getGmgnTokenInfo } = await import("./gmgn.js");
+    const [adv, clusters, gmgnInfo] = await Promise.all([
       getAdvancedInfo(results[0].mint).catch(() => null),
       getClusterList(results[0].mint).catch(() => []),
+      getGmgnTokenInfo(results[0].mint).catch(() => null),
     ]);
+    const gmgnTotalFeeSol = gmgnInfo?.total_fee != null ? Number(gmgnInfo.total_fee) : null;
+    if (Number.isFinite(gmgnTotalFeeSol)) {
+      results[0].global_fees_sol = parseFloat(gmgnTotalFeeSol.toFixed(2));
+      results[0].global_fees_source = "gmgn_total_fee";
+    } else {
+      // GMGN unavailable — leave global_fees_sol null. Filter will skip this candidate
+      // rather than fall back to Jupiter t.fees (priority/jito tips, not real trade fees).
+      results[0].global_fees_source = "unavailable";
+    }
+    const gmgnTradeFeeSol = gmgnInfo?.trade_fee != null ? Number(gmgnInfo.trade_fee) : null;
+    if (Number.isFinite(gmgnTradeFeeSol)) {
+      results[0].gmgn_trade_fee_sol = parseFloat(gmgnTradeFeeSol.toFixed(2));
+    }
     if (adv) {
       results[0].risk_level      = adv.risk_level;
       results[0].bundle_pct      = adv.bundle_pct;
@@ -89,16 +106,24 @@ export async function getTokenInfo({ query }) {
  * Fetches top 100 holders — caller decides how many to display.
  */
 export async function getTokenHolders({ mint, limit = 20 }) {
-  // Fetch holders and total supply in parallel
-  const [holdersRes, tokenRes] = await Promise.all([
+  // Fetch holders, token metadata, and GMGN trade fees in parallel
+  const { getGmgnTokenInfo } = await import("./gmgn.js");
+  const [holdersRes, tokenRes, gmgnInfo] = await Promise.all([
     fetch(`${DATAPI_BASE}/holders/${mint}?limit=100`),
     fetch(`${DATAPI_BASE}/assets/search?query=${mint}`),
+    getGmgnTokenInfo(mint).catch(() => null),
   ]);
   if (!holdersRes.ok) throw new Error(`Holders API error: ${holdersRes.status}`);
   const data = await holdersRes.json();
   const tokenData = tokenRes.ok ? await tokenRes.json() : null;
   const tokenInfo = Array.isArray(tokenData) ? tokenData[0] : tokenData;
   const totalSupply = tokenInfo?.totalSupply || tokenInfo?.circSupply || null;
+
+  // Use GMGN total_fee for global fees (real trade fees, not Jupiter priority/jito tips)
+  const gmgnTotalFeeSol = gmgnInfo?.total_fee != null ? Number(gmgnInfo.total_fee) : null;
+  const globalFeesSol = Number.isFinite(gmgnTotalFeeSol)
+    ? parseFloat(gmgnTotalFeeSol.toFixed(2))
+    : null;
 
   const holders = Array.isArray(data) ? data : (data.holders || data.data || []);
 
@@ -193,7 +218,8 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
   return {
     mint,
-    global_fees_sol: tokenInfo?.fees != null ? parseFloat(tokenInfo.fees.toFixed(2)) : null,
+    global_fees_sol: globalFeesSol,
+    global_fees_source: globalFeesSol != null ? "gmgn_total_fee" : "unavailable",
     total_fetched: holders.length,
     showing: mapped.length,
     top_10_real_holders_pct: top10Pct.toFixed(2),
