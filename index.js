@@ -818,6 +818,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `top10 concentration ${top10Pct}% > ${maxTop10Pct}%` });
         return false;
       }
+      // Token fees hard filter — low global fees = bundled/scam token, not enough real trading activity
+      const tokenFeesSol = ti?.global_fees_sol;
+      const minTokenFeesSol = config.screening.minTokenFeesSol;
+      if (tokenFeesSol != null && minTokenFeesSol != null && Number(tokenFeesSol) < minTokenFeesSol) {
+        log("screening", `Token-fees filter: dropped ${pool.name} — global fees ${tokenFeesSol} SOL < ${minTokenFeesSol} SOL`);
+        filteredOut.push({ name: pool.name, reason: `token fees ${tokenFeesSol} SOL < minTokenFeesSol ${minTokenFeesSol} SOL` });
+        return false;
+      }
       // DLMM supply trap filter — skip if Meteora pools already hold too much of the supply
       const maxDlmmPct = config.screening.maxDlmmSupplyPct ?? 2;
       if (dlmmSupply?.pct > maxDlmmPct) {

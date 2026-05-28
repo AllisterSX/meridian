@@ -42,6 +42,7 @@ function scoreCandidate(pool) {
 }
 
 function numeric(value) {
+  if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
@@ -80,6 +81,21 @@ function getVolatilityTimeframe(sourceTimeframe) {
   const sourceMinutes = TIMEFRAME_MINUTES[source];
   const minMinutes = TIMEFRAME_MINUTES[MIN_VOLATILITY_TIMEFRAME];
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
+}
+
+function getFeesTimeframe() {
+  const configured = String(config.screening.feesTimeframe || config.screening.timeframe || "4h").trim();
+  return TIMEFRAME_MINUTES[configured] != null ? configured : "4h";
+}
+
+function poolFeeSol(pool) {
+  const feeUsd = numeric(pool?.fee);
+  const quotePrice = numeric(pool?.token_y?.price);
+  const quoteIsSol =
+    pool?.token_y?.address === config.tokens.SOL ||
+    String(pool?.token_y?.symbol || "").toUpperCase() === "SOL";
+  if (feeUsd == null || quotePrice == null || quotePrice <= 0 || !quoteIsSol) return null;
+  return feeUsd / quotePrice;
 }
 
 function getRawPoolScreeningRejectReason(pool, s) {
@@ -171,11 +187,12 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
   return res.json();
 }
 
-async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+async function fetchPoolDiscoveryDetail({ poolAddress, timeframe, category = config.screening.category }) {
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=1` +
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
-    `&timeframe=${timeframe}`;
+    `&timeframe=${encodeURIComponent(timeframe)}` +
+    (category ? `&category=${encodeURIComponent(category)}` : "");
 
   const res = await fetch(url);
 
@@ -190,32 +207,64 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
   const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
-  if (sourceTimeframe === volatilityTimeframe) {
-    for (const pool of rawPools) {
-      if (pool) pool.volatility_timeframe = volatilityTimeframe;
+  const feesTimeframe = getFeesTimeframe();
+
+  // Tag primary-timeframe values on every pool before any overwrite.
+  for (const pool of rawPools) {
+    if (!pool) continue;
+    pool[`volume_${sourceTimeframe}`] = pool.volume ?? null;
+    pool[`fee_${sourceTimeframe}`] = pool.fee ?? null;
+    pool[`volatility_${sourceTimeframe}`] = pool.volatility ?? null;
+    pool.volatility_timeframe = volatilityTimeframe;
+    if (feesTimeframe === sourceTimeframe) {
+      pool.fees_sol = poolFeeSol(pool);
+      pool.fees_sol_timeframe = sourceTimeframe;
     }
-    return rawPools;
   }
 
+  if (sourceTimeframe === volatilityTimeframe && sourceTimeframe === feesTimeframe) return rawPools;
+
   const uniquePoolAddresses = [...new Set(rawPools.map((pool) => pool?.pool_address).filter(Boolean))];
-  const volatilityResults = await Promise.allSettled(
-    uniquePoolAddresses.map((poolAddress) =>
-      fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
-        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
+  const timeframesToFetch = [...new Set([volatilityTimeframe, feesTimeframe].filter((tf) => tf !== sourceTimeframe))];
+  const longResults = await Promise.allSettled(
+    uniquePoolAddresses.flatMap((poolAddress) =>
+      timeframesToFetch.map((timeframe) => fetchPoolDiscoveryDetail({ poolAddress, timeframe })
+        .then((pool) => ({
+          poolAddress,
+          timeframe,
+          volatility: numeric(pool?.volatility),
+          volume: numeric(pool?.volume),
+          fee: numeric(pool?.fee),
+          feesSol: poolFeeSol(pool),
+        })))
     )
   );
 
-  const volatilityByPool = new Map();
-  for (const result of volatilityResults) {
+  const metricsByPool = new Map();
+  for (const result of longResults) {
     if (result.status !== "fulfilled") continue;
-    if (result.value.volatility == null) continue;
-    volatilityByPool.set(result.value.poolAddress, result.value.volatility);
+    if (!metricsByPool.has(result.value.poolAddress)) metricsByPool.set(result.value.poolAddress, new Map());
+    metricsByPool.get(result.value.poolAddress).set(result.value.timeframe, result.value);
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
-    pool.volatility_timeframe = volatilityTimeframe;
+    if (!pool?.pool_address) continue;
+    const metricsByTimeframe = metricsByPool.get(pool.pool_address);
+    if (!metricsByTimeframe) continue;
+
+    const volatilityMetrics = metricsByTimeframe.get(volatilityTimeframe);
+    if (volatilityMetrics) {
+      pool[`volume_${volatilityTimeframe}`] = volatilityMetrics.volume;
+      pool[`volatility_${volatilityTimeframe}`] = volatilityMetrics.volatility;
+      if (volatilityMetrics.volatility != null) pool.volatility = volatilityMetrics.volatility;
+    }
+
+    const feeMetrics = metricsByTimeframe.get(feesTimeframe);
+    if (feeMetrics) {
+      pool[`fee_${feesTimeframe}`] = feeMetrics.fee;
+      pool.fees_sol = feeMetrics.feesSol;
+      pool.fees_sol_timeframe = feesTimeframe;
+    }
   }
 
   return rawPools;
@@ -532,6 +581,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     ? Number(config.gmgn.minTvl ?? config.screening.minTvl ?? 0)
     : Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
+  const minVolume = source === "gmgn"
+    ? Number(config.gmgn.minVolume ?? config.screening.minVolume ?? 0)
+    : Number(config.screening.minVolume ?? 0);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
 
   const eligible = pools
@@ -543,6 +595,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
+        return false;
+      }
+      const volume = Number(p.volume_window);
+      if (Number.isFinite(minVolume) && minVolume > 0 && (!Number.isFinite(volume) || volume < minVolume)) {
+        pushFilteredReason(filteredOut, p, `${config.screening.timeframe || "5m"} pool volume $${Number.isFinite(volume) ? volume : "unknown"} below minVolume $${minVolume}`);
         return false;
       }
       const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
@@ -658,6 +715,37 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     }));
 
+    const maxSniperPct = Number(config.screening.maxSniperPct);
+    if (Number.isFinite(maxSniperPct)) {
+      const before = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.sniper_pct == null) return true;
+        if (Number(p.sniper_pct) > maxSniperPct) {
+          log("screening", `Sniper filter: dropped ${p.name} — sniper ${p.sniper_pct}% > ${maxSniperPct}%`);
+          pushFilteredReason(filteredOut, p, `sniper ${p.sniper_pct}% > ${maxSniperPct}%`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < before) log("screening", `Sniper filter removed ${before - eligible.length} pool(s)`);
+    }
+
+    // Bundle holder hard filter — high bundle % = coordinated buy, likely to dump
+    const maxBundlePct = Number(config.screening.maxBundlePct);
+    if (Number.isFinite(maxBundlePct)) {
+      const before = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.bundle_pct == null) return true; // no OKX data → don't filter
+        if (Number(p.bundle_pct) > maxBundlePct) {
+          log("screening", `Bundle filter: dropped ${p.name} — bundle ${p.bundle_pct}% > ${maxBundlePct}%`);
+          pushFilteredReason(filteredOut, p, `bundle ${p.bundle_pct}% > ${maxBundlePct}%`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < before) log("screening", `Bundle filter removed ${before - eligible.length} pool(s)`);
+    }
+
     // ATH filter — drop pools where price is too close to ATH
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
@@ -743,8 +831,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Fetches top 50 pools from discovery API and finds the matching address.
  * Returns the full unfiltered API object (all fields, not condensed).
  */
-export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
-  const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe });
+export async function getPoolDetail({ pool_address, timeframe = "5m", category = config.screening.category }) {
+  const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe, category });
 
   if (!pool) {
     throw new Error(`Pool ${pool_address} not found`);
@@ -758,6 +846,17 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
  * Raw API returns ~100+ fields per pool. The LLM only needs ~20.
  */
 function condensePool(p) {
+  const screeningTimeframe = config.screening.timeframe;
+  const volatilityTimeframe = p.volatility_timeframe || getVolatilityTimeframe(screeningTimeframe);
+  const timeframeBreakdown = volatilityTimeframe !== screeningTimeframe
+    ? {
+        [`volume_${screeningTimeframe}`]: round(p[`volume_${screeningTimeframe}`]),
+        [`volume_${volatilityTimeframe}`]: round(p[`volume_${volatilityTimeframe}`]),
+        [`volatility_${screeningTimeframe}`]: fix(p[`volatility_${screeningTimeframe}`], 4),
+        [`volatility_${volatilityTimeframe}`]: fix(p[`volatility_${volatilityTimeframe}`], 4),
+      }
+    : {};
+
   return {
     pool: p.pool_address,
     name: p.name,
@@ -779,10 +878,13 @@ function condensePool(p) {
     tvl: round(p.tvl),
     active_tvl: round(p.active_tvl),
     fee_window: round(p.fee),
+    fees_sol: fix(p.fees_sol, 2),
+    fees_sol_timeframe: p.fees_sol_timeframe || null,
     volume_window: round(p.volume),
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
     volatility: fix(p.volatility, 4),
-    volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
+    volatility_timeframe: volatilityTimeframe,
+    ...timeframeBreakdown,
 
 
     // Token health
