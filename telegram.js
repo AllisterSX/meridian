@@ -419,12 +419,22 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
+function formatPnlAmount(value, { solMode = false } = {}) {
+  const numeric = Number(value ?? 0);
+  const sign = numeric >= 0 ? "+" : "-";
+  const absValue = Math.abs(numeric);
+  return solMode
+    ? `${sign}◎ ${absValue.toFixed(5)}`
+    : `${sign}$${absValue.toFixed(2)}`;
+}
+
+export async function notifyClose({ pair, pnlUsd, pnlPct, solMode = false }) {
   if (hasActiveLiveMessage()) return;
-  const sign = pnlUsd >= 0 ? "+" : "";
+  const numericPct = Number(pnlPct ?? 0);
+  const pctSign = numericPct >= 0 ? "+" : "-";
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${formatPnlAmount(pnlUsd, { solMode })} (${pctSign}${Math.abs(numericPct).toFixed(2)}%)`
   );
 }
 

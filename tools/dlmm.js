@@ -1,4 +1,5 @@
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
@@ -95,6 +96,17 @@ function getWallet() {
   }
   return _wallet;
 }
+
+// Prepend a compute unit price instruction to push the tx through during congestion.
+// Only applies to legacy Transaction objects (DLMM SDK close/claim txs).
+function withPriorityFee(tx, microLamports = 500_000) {
+  if (tx instanceof Transaction) {
+    tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
+  }
+  return tx;
+}
+
+const SEND_OPTS = { skipPreflight: true };
 
 function getMeridianApiBase() {
   return String(config.api.url || "https://api.agentmeridian.xyz/api").replace(/\/+$/, "");
@@ -576,6 +588,7 @@ export async function deployPosition({
   base_fee,
   volatility,
   fee_tvl_ratio,
+  volume_window,
   organic_score,
   initial_value_usd,
 }) {
@@ -809,6 +822,7 @@ export async function deployPosition({
           bin_step,
           volatility: normalizedVolatility,
           fee_tvl_ratio,
+          volume_window,
           organic_score,
           amount_sol: finalAmountY,
           amount_x: finalAmountX,
@@ -947,6 +961,7 @@ export async function deployPosition({
       bin_step,
       volatility: normalizedVolatility,
       fee_tvl_ratio,
+      volume_window,
       organic_score,
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
@@ -1881,7 +1896,7 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            const claimHash = await sendAndConfirmTransaction(getConnection(), withPriorityFee(tx), [wallet], SEND_OPTS);
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
@@ -1920,7 +1935,7 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        const txHash = await sendAndConfirmTransaction(getConnection(), withPriorityFee(tx), [wallet], SEND_OPTS);
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1929,7 +1944,7 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      const txHash = await sendAndConfirmTransaction(getConnection(), withPriorityFee(closeTx), [wallet], SEND_OPTS);
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];
