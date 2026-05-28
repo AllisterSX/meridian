@@ -83,31 +83,34 @@ export const config = {
     source:            u.screeningSource    ?? "meteora", // meteora | gmgn
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
-    minTvl:            u.minTvl            ?? 10_000,
+    minTvl:            u.minTvl            ?? 5_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
-    minOrganic:        u.minOrganic        ?? 60,
+    minOrganic:        u.minOrganic        ?? 70,
     minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
+    maxBinStep:        u.maxBinStep        ?? 200,
     timeframe:         u.timeframe         ?? "5m",
+    feesTimeframe:     u.feesTimeframe     ?? u.poolFeesTimeframe ?? "4h",
     category:          u.category          ?? "trending",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
+    minTokenFeesSol:   u.minTokenFeesSol   ?? 15,  // global fees paid (priority+jito tips). below = bundled/scam
     useDiscordSignals: u.useDiscordSignals ?? false,
     discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
     avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
     blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
-    maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
+    maxBundlePct:      u.maxBundlePct      ?? 40,  // max bundle holding % (OKX advanced-info)
+    maxSniperPct:      u.maxSniperPct      ?? 30,  // max sniper holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxTop10Pct:       u.maxTop10Pct       ?? 50,  // max top 10 holders concentration
     allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
-    athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    athFilterPct:       u.athFilterPct !== undefined ? u.athFilterPct : null, // null = disabled; negative = only deploy if price is that % below ATH
+    maxDlmmSupplyPct:   u.maxDlmmSupplyPct   ?? 2,   // max % of token supply held by ALL Meteora DLMM pools combined
   },
 
   gmgn: {
@@ -127,10 +130,10 @@ export const config = {
     platforms: gmgnArray("platforms", "gmgnPlatforms", ["Pump.fun", "meteora_virtual_curve", "pool_meteora"]),
     minMcap: gmgnValue("minMcap", "gmgnMinMcap", u.minMcap ?? 150_000),
     maxMcap: gmgnValue("maxMcap", "gmgnMaxMcap", u.maxMcap ?? 10_000_000),
-    minTvl: gmgnValue("minTvl", "gmgnMinTvl", u.minTvl ?? 10_000),
-    minVolume: gmgnValue("minVolume", "gmgnMinVolume", 1000),
+    minTvl: gmgnValue("minTvl", "gmgnMinTvl", u.minTvl ?? 5_000),
+    minVolume: gmgnValue("minVolume", "gmgnMinVolume", 15000),
     minHolders: gmgnValue("minHolders", "gmgnMinHolders", u.minHolders ?? 500),
-    minTokenAgeHours: gmgnValue("minTokenAgeHours", "gmgnMinTokenAgeHours", 2),
+    minTokenAgeHours: gmgnValue("minTokenAgeHours", "gmgnMinTokenAgeHours", 1),
     maxTokenAgeHours: gmgnValue("maxTokenAgeHours", "gmgnMaxTokenAgeHours", 24 * 7),
     minSmartDegenCount: gmgnValue("minSmartDegenCount", "gmgnMinSmartDegenCount", 1),
     requireKol: gmgnValue("requireKol", "gmgnRequireKol", true),
@@ -146,8 +149,8 @@ export const config = {
     maxBotDegenRate: gmgnValue("maxBotDegenRate", "gmgnMaxBotDegenRate", 0.4),
     maxSniperCount: gmgnValue("maxSniperCount", "gmgnMaxSniperCount", 20),
     maxSniperHoldRate: gmgnValue("maxSniperHoldRate", "gmgnMaxSniperHoldRate", 0.3),
-    minTotalFeeSol: gmgnValue("minTotalFeeSol", "gmgnMinTotalFeeSol", 30),
-    athFilterPct: gmgnValue("athFilterPct", "gmgnAthFilterPct", null),
+    minTotalFeeSol: gmgnValue("minTotalFeeSol", "gmgnMinTotalFeeSol", 15),
+    athFilterPct: gmgnValue("athFilterPct", "gmgnAthFilterPct", 95),
     preferredKolNames: gmgnArray("preferredKolNames", "gmgnPreferredKolNames", []),
     dumpKolNames: gmgnArray("dumpKolNames", "gmgnDumpKolNames", []),
     indicatorFilter: gmgnValue("indicatorFilter", "gmgnIndicatorFilter", true),
@@ -168,7 +171,7 @@ export const config = {
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
-    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? true,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
@@ -181,8 +184,14 @@ export const config = {
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
-    minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
-    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    minFeePerTvl24h:       u.minFeePerTvl24h       ?? 10,
+    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 30, // minutes before low yield can trigger close
+    lowYieldGoodStableExtraMinutes: u.lowYieldGoodStableExtraMinutes ?? 30,
+    lowYieldGoodStableMinOrganic: u.lowYieldGoodStableMinOrganic ?? 80,
+    lowYieldStableMaxVolatility: u.lowYieldStableMaxVolatility ?? 4,
+    lowYieldGoodStableMinEntryFeeTvl: u.lowYieldGoodStableMinEntryFeeTvl ?? 0.05,
+    lowYieldGoodStableMinVolume: u.lowYieldGoodStableMinVolume ?? 500,
+    lowYieldStableMinPnlPct: u.lowYieldStableMinPnlPct ?? -1,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -216,9 +225,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "MiniMax-M2.5",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "MiniMax-M2.7",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "MiniMax-M2.5",
   },
 
   // ─── Darwinian Signal Weighting ───────
@@ -334,11 +343,13 @@ export function reloadScreeningThresholds() {
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
+    if (fresh.maxSniperPct      != null) s.maxSniperPct     = fresh.maxSniperPct;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.maxDlmmSupplyPct  != null) s.maxDlmmSupplyPct = fresh.maxDlmmSupplyPct;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

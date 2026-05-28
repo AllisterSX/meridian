@@ -26,19 +26,21 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, getLowYieldExtension } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, purgeStaleSnapshots } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
-import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { getTokenNarrative, getTokenInfo, getTokenHolders } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { confirmIndicatorPreset } from "./tools/chart-indicators.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
-  ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url)
+  ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url) ||
+    process.env.NODE_APP_INSTANCE !== undefined
   : false;
 
 if (isMain) {
@@ -81,6 +83,127 @@ function buildPrompt() {
 }
 
 // ═══════════════════════════════════════════
+//  METEORA DLMM POOL DETECTION
+// ═══════════════════════════════════════════
+// Strategy: get all DLMM pool addresses for a token from Meteora API.
+// Each holder address is checked against this set — no tag dependency.
+const _dlmmPoolAddressCache = new Map(); // mint → { addresses: Set, meta: Map, expiresAt }
+const _dlmmAddrVerifyCache  = new Map(); // address → { isDlmm: boolean, expiresAt }
+const DLMM_POOL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getMeteoraDlmmPoolAddresses(mint, label = null) {
+  const now = Date.now();
+  const cached = _dlmmPoolAddressCache.get(mint);
+  if (cached && now < cached.expiresAt) return cached.addresses;
+  const displayName = label || mint?.slice(0, 8);
+  try {
+    const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    const pools = (Array.isArray(data?.data) ? data.data : [])
+      .filter(p => p?.token_x?.address === mint || p?.token_y?.address === mint);
+    const addresses = new Set(pools.map(p => p.address).filter(Boolean));
+    const meta = new Map(pools.map(p => {
+      const rawFee = p.base_fee_percentage ?? p.fee_pct ?? p.base_fee_rate;
+      return [p.address, {
+        bin_step: p.bin_step ?? p.dlmm_params?.bin_step ?? null,
+        fee_pct:  rawFee != null ? Number(rawFee) : null,
+        name:     p.name || null,
+        liquidity: p.liquidity ?? p.tvl ?? null,
+        mcap:     p.token_x?.market_cap ?? null,
+      }];
+    }));
+    _dlmmPoolAddressCache.set(mint, { addresses, meta, expiresAt: now + DLMM_POOL_CACHE_TTL_MS });
+    return addresses;
+  } catch (e) {
+    log("screening_warn", `Meteora pool list unavailable for ${displayName}: ${e.message}`);
+    return new Set();
+  }
+}
+
+function getDlmmPoolLabel(address, mint) {
+  const cached = mint ? _dlmmPoolAddressCache.get(mint) : null;
+  const meta = cached?.meta?.get(address);
+  if (meta) {
+    const parts = [];
+    if (meta.bin_step != null) parts.push(meta.bin_step);
+    if (meta.fee_pct  != null) parts.push(`${meta.fee_pct}%`);
+    if (parts.length > 0) return parts.join("/");
+    return meta.name || address.slice(0, 8);
+  }
+  return address.slice(0, 8);
+}
+
+async function isMeteoraDlmmPool(address) {
+  const now = Date.now();
+  const cached = _dlmmAddrVerifyCache.get(address);
+  if (cached && now < cached.expiresAt) return cached.isDlmm;
+  try {
+    const url = `https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&timeframe=5m&filter_by=${encodeURIComponent(`pool_address=${address}`)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) { _dlmmAddrVerifyCache.set(address, { isDlmm: false, expiresAt: now + DLMM_POOL_CACHE_TTL_MS }); return false; }
+    const data = await res.json();
+    const isDlmm = (data.data || []).length > 0;
+    _dlmmAddrVerifyCache.set(address, { isDlmm, expiresAt: now + DLMM_POOL_CACHE_TTL_MS });
+    return isDlmm;
+  } catch { return false; }
+}
+
+async function verifyUnknownPoolHolders(holders, knownDlmmAddresses) {
+  const unknownPools = holders.filter(h => h.is_pool === true && !knownDlmmAddresses.has(h.address));
+  if (unknownPools.length === 0) return knownDlmmAddresses;
+  const results = await Promise.allSettled(unknownPools.map(h => isMeteoraDlmmPool(h.address)));
+  const verified = new Set(knownDlmmAddresses);
+  unknownPools.forEach((h, i) => {
+    if (results[i].status === "fulfilled" && results[i].value === true) verified.add(h.address);
+  });
+  return verified;
+}
+
+function computeDlmmSupplyPct(holders, knownDlmmAddresses, knownPoolAddr = null, dlmmMetaCache = null) {
+  const dlmmHolders = holders.filter(h => {
+    if (knownDlmmAddresses.has(h.address)) return true;
+    if (knownPoolAddr && h.address === knownPoolAddr) return true;
+    return false;
+  });
+  const rawHolderAddrs = new Set(holders.map(h => h.address));
+  const missingDlmmAddrs = [...knownDlmmAddresses].filter(addr =>
+    !rawHolderAddrs.has(addr) && addr !== knownPoolAddr
+  );
+  if (knownPoolAddr && !rawHolderAddrs.has(knownPoolAddr)) missingDlmmAddrs.push(knownPoolAddr);
+  const syntheticStubs = missingDlmmAddrs.map(addr => {
+    let estimatedPct = null;
+    if (dlmmMetaCache) {
+      const meta = dlmmMetaCache.get(addr);
+      if (meta?.liquidity != null && meta?.mcap != null && meta.mcap > 0) {
+        estimatedPct = Math.round((meta.liquidity / 2 / meta.mcap) * 10000) / 100;
+      }
+    }
+    return { address: addr, pct: estimatedPct ?? 0, percent: estimatedPct ?? 0, _synthetic: true, _estimated: estimatedPct != null };
+  });
+  const totalPct = Math.round(dlmmHolders.reduce((sum, h) => sum + (h.pct ?? h.percent ?? 0), 0) * 100) / 100;
+  const allDlmmForRanking = [...dlmmHolders, ...syntheticStubs];
+  const sorted = [...allDlmmForRanking].sort((a, b) => (b.pct ?? b.percent ?? 0) - (a.pct ?? a.percent ?? 0));
+  const method = knownDlmmAddresses.size > 0 ? "meteora-api" : knownPoolAddr ? "pool-addr-only" : "none";
+  const allSorted = [...holders].sort((a, b) => (b.pct ?? b.percent ?? 0) - (a.pct ?? a.percent ?? 0));
+  const rankMap = new Map(allSorted.map((h, i) => [h.address, i + 1]));
+  const rankedDlmmHolders = sorted.map(h => {
+    let holderRank = rankMap.get(h.address) ?? null;
+    if (holderRank === null && h._synthetic) holderRank = null;
+    const { _synthetic, _estimated, ...rest } = h;
+    return { ...rest, holderRank, _estimated: h._estimated ?? false };
+  });
+  return {
+    pct: totalPct,
+    poolCount: dlmmHolders.length,
+    topHolder: rankedDlmmHolders.find(h => !h._estimated) ?? null,
+    allHolders: rankedDlmmHolders,
+    detectionMethod: method,
+  };
+}
+
+// ═══════════════════════════════════════════
 //  CRON DEFINITIONS
 // ═══════════════════════════════════════════
 let _cronTasks = [];
@@ -88,8 +211,8 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
-const _peakConfirmTimers = new Map();
-const _trailingDropConfirmTimers = new Map();
+const _closedNotifSent = new Set(); // dedup close-position Telegram notifications (cleared daily)
+const _peakConfirmTimers = new Map();const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
@@ -116,6 +239,26 @@ function shouldUsePnlRecheck() {
   return !config.api.lpAgentRelayEnabled;
 }
 
+async function confirmExitIndicator(position, closeReason) {
+  if (!config.indicators.enabled) {
+    return { confirmed: true, skipped: true, reason: "Indicators disabled" };
+  }
+  if (!position?.base_mint) {
+    return { confirmed: true, skipped: true, reason: "Missing base mint for indicator lookup" };
+  }
+  const confirmation = await confirmIndicatorPreset({
+    mint: position.base_mint,
+    side: "exit",
+  });
+  if (!confirmation.confirmed) {
+    log(
+      "indicators",
+      `Exit confirmation rejected for ${position.pair} (${closeReason}): ${confirmation.reason}`,
+    );
+  }
+  return confirmation;
+}
+
 function schedulePeakConfirmation(positionAddress) {
   if (!positionAddress || _peakConfirmTimers.has(positionAddress)) return;
 
@@ -124,7 +267,9 @@ function schedulePeakConfirmation(positionAddress) {
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const position = result?.positions?.find((p) => p.position === positionAddress);
-      resolvePendingPeak(positionAddress, position?.pnl_pct ?? null, TRAILING_PEAK_CONFIRM_TOLERANCE);
+      // Use same PnL source as queuing (pnl_true_pct ?? pnl_pct) for consistent comparison
+      const recheckPnl = (position?.pnl_true_pct ?? position?.pnl_pct) ?? null;
+      resolvePendingPeak(positionAddress, recheckPnl, TRAILING_PEAK_CONFIRM_TOLERANCE);
     } catch (error) {
       log("state_warn", `Peak confirmation failed for ${positionAddress}: ${error.message}`);
     }
@@ -141,9 +286,11 @@ function scheduleTrailingDropConfirmation(positionAddress) {
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const position = result?.positions?.find((p) => p.position === positionAddress);
+      // Use same PnL source as queuing (pnl_true_pct ?? pnl_pct) for consistent comparison
+      const recheckPnl = (position?.pnl_true_pct ?? position?.pnl_pct) ?? null;
       const resolved = resolvePendingTrailingDrop(
         positionAddress,
-        position?.pnl_pct ?? null,
+        recheckPnl,
         config.management.trailingDropPct,
         TRAILING_DROP_CONFIRM_TOLERANCE_PCT,
       );
@@ -207,6 +354,11 @@ export async function runManagementCycle({ silent = false } = {}) {
   let liveMessage = null;
   const screeningCooldownMs = 5 * 60 * 1000;
 
+  // Purge stale pool-memory snapshots (pools with no active position for 24h).
+  // Cheap synchronous operation — no LLM, no network. Keeps pool-memory.json lean
+  // so recallForPool() doesn't inject stale trend data into the prompt.
+  try { purgeStaleSnapshots(); } catch (e) { log("cron_error", `purgeStaleSnapshots failed: ${e.message}`); }
+
   try {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
@@ -221,25 +373,73 @@ export async function runManagementCycle({ silent = false } = {}) {
       return mgmtReport;
     }
 
+    // Fetch DLMM supply concentration per position (parallel, best-effort)
+    const dlmmSupplyMap = new Map(); // position → { pct, poolCount, rank, allHolders, detectionMethod }
+    await Promise.allSettled(
+      positions.map(async (p) => {
+        const mint = p.base_mint;
+        const poolAddr = p.pool;
+        if (!mint || !poolAddr) return;
+        try {
+          const holderRes = await getTokenHolders({ mint, limit: 30 });
+          const holders = holderRes?.holders ?? [];
+          let knownAddrs = await getMeteoraDlmmPoolAddresses(mint, p.pair);
+          knownAddrs = await verifyUnknownPoolHolders(holders, knownAddrs);
+          const dlmmResult = computeDlmmSupplyPct(holders, knownAddrs, poolAddr, _dlmmPoolAddressCache.get(mint)?.meta ?? null);
+          const allSorted = [...holders].sort((a, b) => (b.pct ?? b.percent ?? 0) - (a.pct ?? a.percent ?? 0));
+          const rank = allSorted.findIndex(h => h.address === poolAddr);
+          dlmmSupplyMap.set(p.position, {
+            pct: dlmmResult.pct,
+            poolCount: dlmmResult.poolCount,
+            topHolder: dlmmResult.topHolder,
+            allHolders: dlmmResult.allHolders,
+            rank: rank >= 0 ? rank + 1 : null,
+            detectionMethod: dlmmResult.detectionMethod,
+          });
+          const allHolders = dlmmResult.allHolders ?? [];
+          const realHoldersForLog = allHolders.filter(h => (!h._estimated && (h.pct ?? h.percent ?? 0) > 0) || h.address === poolAddr);
+          const estimatedStubs = allHolders.filter(h => h._estimated && h.address !== poolAddr);
+          const holderDetail = realHoldersForLog.length > 0
+            ? realHoldersForLog.map(h => {
+                const label   = getDlmmPoolLabel(h.address, mint);
+                const pct     = h.pct ?? h.percent ?? 0;
+                const rankStr = h.holderRank != null ? `#${h.holderRank}` : ">30";
+                const isSelf  = h.address === poolAddr;
+                return `${rankStr} ${label} @${pct}%${isSelf ? " ← our position" : ""}`;
+              }).join(" | ")
+            : null;
+          const estimatedNote = estimatedStubs.length > 0
+            ? ` (+${estimatedStubs.length} more pools ~${estimatedStubs.reduce((s, h) => s + (h.pct ?? 0), 0).toFixed(2)}% est.)`
+            : "";
+          log("cron", `DLMM supply for ${p.pair}: ${dlmmResult.pct}% across ${dlmmResult.allHolders?.length ?? 0} pool(s)${holderDetail ? ` | holders: ${holderDetail}` : ""}${estimatedNote}`);
+        } catch { /* best-effort */ }
+      })
+    );
+
     // Snapshot + load pool memory
     const positionData = positions.map((p) => {
-      recordPositionSnapshot(p.pool, p);
-      return { ...p, recall: recallForPool(p.pool) };
+      const enriched = { ...p };
+      if (!p.in_range && p.active_bin != null && p.upper_bin != null && p.lower_bin != null) {
+        enriched.oor_direction = p.active_bin > p.upper_bin ? "pump" : "dump";
+      } else {
+        enriched.oor_direction = null;
+      }
+      recordPositionSnapshot(p.pool, enriched);
+      return { ...enriched, recall: recallForPool(p.pool) };
     });
 
-    // JS trailing TP check
+    // JS trailing TP check — use pnl_true_pct (pure SOL fee yield, immune to SOL price swings).
+    // Exception: when OOR, pnl_true_pct is frozen (no new fees earned). Use pnl_pct (actual value
+    // including token price decline) so trailing TP and stop-loss can still fire during a dump.
     const exitMap = new Map();
     for (const p of positionData) {
-      if (
-        !p.pnl_pct_suspicious &&
-        queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
-        shouldUsePnlRecheck()
-      ) {
+      const pnlForTrailing = (!p.in_range && p.pnl_pct != null) ? p.pnl_pct : (p.pnl_true_pct ?? p.pnl_pct);
+      if (!p.pnl_pct_suspicious && pnlForTrailing != null && queuePeakConfirmation(p.position, pnlForTrailing)) {
         schedulePeakConfirmation(p.position);
       }
-      const exit = updatePnlAndCheckExits(p.position, p, config.management);
+      const exit = updatePnlAndCheckExits(p.position, { ...p, pnl_pct: pnlForTrailing }, config.management);
       if (exit) {
-        if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
+        if (exit.action === "TRAILING_TP" && exit.needs_confirmation) {
           if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
             scheduleTrailingDropConfirmation(p.position);
           }
@@ -256,6 +456,14 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
+        const indicatorConfirmation = await confirmExitIndicator(p, exitMap.get(p.position));
+        if (!indicatorConfirmation.confirmed) {
+          actionMap.set(p.position, {
+            action: "STAY",
+            indicatorHold: indicatorConfirmation.reason,
+          });
+          continue;
+        }
         actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
         continue;
       }
@@ -267,7 +475,28 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const closeRule = getDeterministicCloseRule(p, config.management);
       if (closeRule) {
+        const indicatorConfirmation = await confirmExitIndicator(p, closeRule.reason);
+        if (!indicatorConfirmation.confirmed) {
+          actionMap.set(p.position, {
+            action: "STAY",
+            indicatorHold: indicatorConfirmation.reason,
+          });
+          continue;
+        }
         actionMap.set(p.position, closeRule);
+        continue;
+      }
+      // Rule 6: Meteora DLMM pool became top holder — supply trapped in LP
+      const dlmmData = dlmmSupplyMap.get(p.position);
+      const maxDlmmPct = config.screening.maxDlmmSupplyPct ?? 2;
+      if (dlmmData && dlmmData.pct > maxDlmmPct) {
+        const rankStr = dlmmData.rank != null ? ` (rank #${dlmmData.rank} holder)` : "";
+        log("cron", `Rule 6 triggered for ${p.pair}: ${dlmmData.poolCount ?? 1} DLMM pool(s) hold ${dlmmData.pct}% of supply combined${rankStr}`);
+        actionMap.set(p.position, {
+          action: "CLOSE",
+          rule: 6,
+          reason: `${dlmmData.poolCount ?? 1} Meteora DLMM pool(s) hold ${dlmmData.pct}% of supply combined${rankStr} — supply trapped in LP [detected via: ${dlmmData.detectionMethod ?? "tag"}]`,
+        });
         continue;
       }
       // Claim rule
@@ -288,10 +517,32 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const dlmmInfo = dlmmSupplyMap.get(p.position);
+      const dlmmRankedLines = (dlmmInfo?.allHolders?.length > 0)
+        ? dlmmInfo.allHolders
+            .filter(h => !h._estimated && (h.pct ?? h.percent ?? 0) > 0)
+            .map(h => {
+              const label   = getDlmmPoolLabel(h.address, p.base_mint);
+              const pct     = h.pct ?? h.percent ?? 0;
+              const rankStr = h.holderRank != null ? `#${h.holderRank}` : ">30";
+              const isSelf  = h.address === p.pool;
+              return `${rankStr} ${label} @${pct}%${isSelf ? " ← our position" : ""}`;
+            }).join("; ") || null
+        : null;
+      const dlmmBlock = dlmmInfo?.pct > 0
+        ? `\ndlmm_supply: ${dlmmInfo.pct}% held by ${dlmmInfo.poolCount ?? 1} pool(s) (our pool rank #${dlmmInfo.rank ?? "?"} among all token holders) — threshold: ${config.screening.maxDlmmSupplyPct ?? 2}%` +
+          (dlmmRankedLines ? ` | dlmm_holders: ${dlmmRankedLines}` : "")
+        : "";
+      const dlmmLine = dlmmInfo?.pct > 0 ? ` | DLMM: ${dlmmInfo.pct}%×${dlmmInfo.poolCount ?? 1}pool${dlmmInfo.rank ? ` (our pool #${dlmmInfo.rank})` : ""}` : "";
+      const pnlDisplay = !p.in_range && p.pnl_pct != null
+        ? `fees ${p.pnl_true_pct ?? "?"}% / actual ${p.pnl_pct}%`
+        : `${p.pnl_true_pct ?? p.pnl_pct ?? "?"}%`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${pnlDisplay} | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange}${dlmmLine} | ${statusLabel}`;
+      if (dlmmBlock) line += dlmmBlock;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.indicatorHold) line += `\nIndicator hold: ${act.indicatorHold}`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
       return line;
     });
@@ -316,11 +567,28 @@ export async function runManagementCycle({ silent = false } = {}) {
 
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
+        const d = dlmmSupplyMap.get(p.position);
+        const dlmmLine = d?.pct > 0
+          ? (() => {
+              const rankNote = d.rank ? ` (our pool rank #${d.rank} among all token holders)` : "";
+              const allRanked = (d.allHolders?.length > 1)
+                ? " | " + d.allHolders
+                    .filter(h => (h.pct ?? h.percent ?? 0) > 0)
+                    .map(h => {
+                      const label  = getDlmmPoolLabel(h.address, p.base_mint ?? p.pool);
+                      const isSelf = h.address === p.pool;
+                      return `${h.holderRank != null ? `#${h.holderRank}` : ">30"} ${label} @${h.pct ?? h.percent ?? 0}%${isSelf ? " ← our position" : ""}`;
+                    }).join("; ")
+                : "";
+              return `  dlmm_supply: ${d.pct}% held by ${d.poolCount ?? 1} Meteora DLMM pool(s)${rankNote} — threshold: ${config.screening.maxDlmmSupplyPct ?? 2}%${allRanked}`;
+            })()
+          : null;
         return [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
-          `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+          `  pnl_fee_yield: ${p.pnl_true_pct ?? "?"}% | pnl_actual: ${p.pnl_pct ?? "?"}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+          dlmmLine,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
         ].filter(Boolean).join("\n");
@@ -341,7 +609,24 @@ Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already a
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        // Suppress executor's notifyClose — onToolFinish sends it with dedup
+        toolArgInjector: (name, args) => name === "close_position" ? { ...args, skip_notify: true } : args,
+        onToolFinish: async ({ name, result, success }) => {
+          await liveMessage?.toolFinish(name, result, success);
+          // Send close notification once per position (deduped by position address)
+          if (name === "close_position" && success && result?.success && result?.pool_name && telegramEnabled()) {
+            const dedupKey = result.position || (result.txs && result.txs[0]) || result.pool_name;
+            if (dedupKey && !_closedNotifSent.has(dedupKey)) {
+              _closedNotifSent.add(dedupKey);
+              const displayPnl = config.management.solMode ? (result.pnl_sol ?? result.pnl_usd ?? 0) : (result.pnl_usd ?? 0);
+              const pnlPct = result.pnl_pct ?? 0;
+              const sign = displayPnl >= 0 ? "+" : "";
+              const emoji = displayPnl >= 0 ? "🔓" : "🔒";
+              const reasonLine = result.close_reason ? `\nReason: ${result.close_reason}` : "";
+              sendMessage(`${emoji} Closed ${result.pool_name}\nPnL: ${sign}${config.management.solMode ? "◎" : "$"}${displayPnl.toFixed(4)} (${sign}${pnlPct.toFixed(2)}%)${reasonLine}`).catch(() => {});
+            }
+          }
+        },
       });
 
       mgmtReport += `\n\n${content}`;
@@ -362,6 +647,7 @@ After executing, write a brief one-line result per position.
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
+    drainTelegramQueue().catch(() => {});
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
@@ -459,20 +745,52 @@ export async function runScreeningCycle({ silent = false } = {}) {
         mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
         mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
       ]);
+
+      // ── Meteora DLMM supply concentration for this candidate ──────────
+      let dlmmSupply = { pct: 0, poolCount: 0, allHolders: [], detectionMethod: "none" };
+      if (mint) {
+        try {
+          const holderRes = await getTokenHolders({ mint, limit: 30 });
+          const rawHolders = holderRes?.holders ?? [];
+          let knownDlmmAddrs = await getMeteoraDlmmPoolAddresses(mint, pool.name);
+          knownDlmmAddrs = await verifyUnknownPoolHolders(rawHolders, knownDlmmAddrs);
+          // Enrich cache with this pool's own metadata so getDlmmPoolLabel produces readable labels
+          if (pool.pool && pool.bin_step != null) {
+            const feeNum = pool.fee_pct != null ? Number(pool.fee_pct) : null;
+            const existingCacheEntry = _dlmmPoolAddressCache.get(mint);
+            if (existingCacheEntry) {
+              existingCacheEntry.addresses.add(pool.pool);
+              if (!existingCacheEntry.meta.has(pool.pool)) {
+                existingCacheEntry.meta.set(pool.pool, { bin_step: pool.bin_step, fee_pct: feeNum, name: pool.name });
+              }
+            } else {
+              const addrSet = new Set([pool.pool]);
+              const metaMap = new Map([[pool.pool, { bin_step: pool.bin_step, fee_pct: feeNum, name: pool.name }]]);
+              _dlmmPoolAddressCache.set(mint, { addresses: addrSet, meta: metaMap, expiresAt: Date.now() + DLMM_POOL_CACHE_TTL_MS });
+            }
+          }
+          dlmmSupply = computeDlmmSupplyPct(rawHolders, knownDlmmAddrs, pool.pool, _dlmmPoolAddressCache.get(mint)?.meta ?? null);
+          if (dlmmSupply.pct > 0) {
+            log("screening", `DLMM supply for ${pool.name}: ${dlmmSupply.pct}% supply across ${dlmmSupply.allHolders?.length ?? 0} pool(s)`);
+          }
+        } catch { /* best-effort */ }
+      }
+
       allCandidates.push({
         pool,
         sw: smartWallets.status === "fulfilled" ? smartWallets.value : null,
         n: narrative.status === "fulfilled" ? narrative.value : null,
         ti: tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null,
         mem: recallForPool(pool.pool),
+        dlmmSupply,
       });
       await new Promise(r => setTimeout(r, 150)); // avoid 429s
     }
 
-    // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
+    // Hard filters after token recon — block launchpads, excessive Jupiter bot holders, and DLMM supply traps
     // Skipped for GMGN: platforms already filtered upstream; bundler/bot data from GMGN pipeline
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const passing = allCandidates.filter(({ pool, ti, dlmmSupply }) => {
       if (pool.gmgn) return true;
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
@@ -492,6 +810,13 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // DLMM supply trap filter — skip if Meteora pools already hold too much of the supply
+      const maxDlmmPct = config.screening.maxDlmmSupplyPct ?? 2;
+      if (dlmmSupply?.pct > maxDlmmPct) {
+        log("screening", `DLMM supply filter: dropped ${pool.name} — ${dlmmSupply.poolCount ?? 1} DLMM pool(s) hold ${dlmmSupply.pct}% of supply`);
+        filteredOut.push({ name: pool.name, reason: `DLMM supply trapped: ${dlmmSupply.pct}% > ${maxDlmmPct}%` });
+        return false;
+      }
       return true;
     });
 
@@ -501,7 +826,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
         .join("\n");
       const funnelBlock = buildGmgnFunnelReport(gmgnStageCounts, gmgnAllFiltered, { fromStage: 2 });
-      const thresholds = `Thresholds: tvl>$${config.screening.minTvl} | vol>$${config.screening.minVolume} | organic>${config.screening.minOrganic}% | holders>${config.screening.minHolders} | fee/tvl>${config.screening.minFeeActiveTvlRatio}%`;
+      const thresholds = `Thresholds: tvl >= $${config.screening.minTvl} | vol >= $${config.screening.minVolume} | minimum organic score required: ${config.screening.minOrganic} (reject if organic < ${config.screening.minOrganic}) | holders >= ${config.screening.minHolders} | fee/tvl >= ${config.screening.minFeeActiveTvlRatio}%`;
       screenReport = funnelBlock
         ? `No candidates available.\n\n${funnelBlock}`
         : combinedExamples
@@ -560,10 +885,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
     );
 
     // Build compact candidate blocks
-    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
+    const candidateBlocks = passing.map(({ pool, sw, n, ti, mem, dlmmSupply }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
-      const feesSol = ti?.global_fees_sol ?? "?";
+      const poolFeesSol = pool.fees_sol ?? "?";
+      const poolFeesTimeframe = pool.fees_sol_timeframe || config.screening.feesTimeframe || "?";
+      const tokenFeesSol = ti?.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
@@ -609,8 +936,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
         block = [
           `POOL: ${pool.name} (${pool.pool})`,
           `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
-          `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+          `  audit: top10=${top10Pct}%, bots=${botPct}%, pool_fees_${poolFeesTimeframe}=${poolFeesSol}SOL, token_fees=${tokenFeesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
           gmgnPriceLine,
+          dlmmSupply?.pct > 0
+            ? `  dlmm_supply: ${dlmmSupply.pct}% held by ${dlmmSupply.poolCount ?? 1} Meteora DLMM pool(s)${dlmmSupply.pct >= 1 ? " ⚠️ approaching limit" : ""}`
+            : null,
           pvpLine,
           okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
           okxTags  ? `  tags: ${okxTags}` : null,
@@ -651,13 +981,14 @@ SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
-PRE-LOADED CANDIDATES (${passing.length} pools):
+CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide whether any candidate is worth deploying. A single remaining candidate is not automatically good enough.
 2. Pick the best candidate only if it has real conviction from narrative quality, smart wallets, and pool metrics. If the list has only one pool and it lacks narrative or smart-wallet confirmation, skip the cycle.
-3. If a pool qualifies, call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
+   Pool memory OOR context: OOR with positive realized PnL is not a pool skip reason by itself; treat it as a profitable momentum exit unless current metrics are weak.
+3. If a pool qualifies, call deploy_position. The deploy tool performs fresh Pool Discovery safety checks before any transaction; ${config.screening.timeframe} volume is already screened before candidates reach you.
    strategy = ${config.strategy.strategy} (always use this, never change it).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*${config.strategy.maxBinsBelow - config.strategy.minBinsBelow}) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
@@ -716,8 +1047,10 @@ STEPS:
    <short flat list of top candidate names and why they were skipped>
 IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
+- Never infer low volume for a pool that was not actually blocked by deploy_position. If candidate vol is >= ${config.screening.minVolume}, do not list "vol < ${config.screening.minVolume}" unless that exact pool's deploy_position result returned a volume safety block.
 - Keep the whole report compact and highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+        noActionPattern: /⛔\s*NO DEPLOY/i,
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
@@ -752,6 +1085,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    drainTelegramQueue().catch(() => {});
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
@@ -787,6 +1121,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
       _managementBusy = false;
+      drainTelegramQueue().catch(() => {});
     }
   });
 
@@ -810,16 +1145,18 @@ Summarize the current portfolio health, total fees earned, and performance of al
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
-        if (
-          !p.pnl_pct_suspicious &&
-          queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
-          shouldUsePnlRecheck()
-        ) {
+        const pnlForPoll = (!p.in_range && p.pnl_pct != null) ? p.pnl_pct : (p.pnl_true_pct ?? p.pnl_pct);
+        if (!p.pnl_pct_suspicious && pnlForPoll != null && queuePeakConfirmation(p.position, pnlForPoll)) {
           schedulePeakConfirmation(p.position);
         }
-        const exit = updatePnlAndCheckExits(p.position, p, config.management);
+        const exit = updatePnlAndCheckExits(p.position, { ...p, pnl_pct: pnlForPoll }, config.management);
         if (exit) {
-          if (exit.action === "TRAILING_TP" && exit.needs_confirmation && shouldUsePnlRecheck()) {
+          const indicatorConfirmation = await confirmExitIndicator(p, exit.reason);
+          if (!indicatorConfirmation.confirmed) {
+            log("state", `[PnL poll] Exit alert suppressed by indicators: ${p.pair} — ${indicatorConfirmation.reason}`);
+            continue;
+          }
+          if (exit.action === "TRAILING_TP" && exit.needs_confirmation) {
             if (queueTrailingDropConfirmation(p.position, exit.peak_pnl_pct, exit.current_pnl_pct, config.management.trailingDropPct)) {
               scheduleTrailingDropConfirmation(p.position);
             }
@@ -965,8 +1302,13 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    (position.age_minutes ?? 0) >= managementConfig.minAgeBeforeYieldCheck
   ) {
+    const extension = getLowYieldExtension(tracked, position, managementConfig);
+    if (extension.extend) {
+      log("cron", `Holding ${position.pair} through low yield until ${extension.untilAgeMinutes}m (${extension.reason})`);
+      return null;
+    }
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
   return null;
@@ -1545,6 +1887,7 @@ async function deployLatestCandidate(index) {
     bin_step: candidate.bin_step,
     base_fee: candidate.base_fee,
     volatility: candidate.volatility,
+    volume_window: candidate.volume_window ?? null,
     fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
     organic_score: candidate.organic_score,
     initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
@@ -1614,7 +1957,7 @@ async function telegramHandler(msg) {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
   }
-  if (_managementBusy || _screeningBusy || busy) {
+  if ((_managementBusy || _screeningBusy || busy) && !text.startsWith("/")) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);
       sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
@@ -1708,7 +2051,14 @@ async function telegramHandler(msg) {
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const pnlPct = Number(result.pnl_pct ?? 0);
+        const pnlPctText = Number.isFinite(pnlPct)
+          ? `${pnlPct >= 0 ? "+" : "-"}${Math.abs(pnlPct).toFixed(2)}%`
+          : "?";
+        const pnlText = result.pnl_usd == null
+          ? "?"
+          : `${fmtPnlAmount(result.pnl_usd, config.management.solMode)} (${pnlPctText})`;
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${pnlText} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -1888,6 +2238,13 @@ async function telegramHandler(msg) {
 function fmtPct(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `${n.toFixed(2)}%` : "?";
+}
+
+function fmtPnlAmount(value, solMode = false) {
+  const n = Number(value ?? 0);
+  const sign = n >= 0 ? "+" : "-";
+  const amount = Math.abs(n);
+  return solMode ? `${sign}◎ ${amount.toFixed(5)}` : `${sign}$${amount.toFixed(2)}`;
 }
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
@@ -2085,6 +2442,7 @@ Commands:
       console.log(`  minVolume:            ${s.minVolume}`);
       console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
       console.log(`  maxBundlePct:         ${s.maxBundlePct}`);
+      console.log(`  maxSniperPct:         ${s.maxSniperPct}`);
       console.log(`  maxBotHoldersPct:     ${s.maxBotHoldersPct}`);
       console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
       console.log(`  timeframe:            ${s.timeframe}`);
