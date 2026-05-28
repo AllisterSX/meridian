@@ -22,7 +22,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
-import { fetchFreshGmgnRankVolume } from "./gmgn.js";
+import { getGmgnTokenInfo } from "./gmgn.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -111,7 +111,6 @@ async function validateDeployPoolThresholds(args) {
     let gmgnVolume = null;
     let gmgnPriceChange5m = null;
     try {
-      const { getGmgnTokenInfo } = await import("./gmgn.js");
       const info = await getGmgnTokenInfo(baseMint);
       const priceNow = numberOrNull(info?.price?.price);
       const price5mAgo = numberOrNull(info?.price?.price_5m);
